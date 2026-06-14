@@ -98,6 +98,7 @@ def train_model(
     lambda_align: float = 0.0,
     patience: int = 8,
     desc: str = "train",
+    show_progress: bool = True,
 ) -> tuple[MultimodalClassifier, dict[str, float]]:
     model = model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -107,7 +108,7 @@ def train_model(
     best_metrics: dict[str, float] = {}
     stale_epochs = 0
 
-    progress = tqdm(range(1, epochs + 1), desc=desc, leave=False)
+    progress = tqdm(range(1, epochs + 1), desc=desc, leave=False, disable=not show_progress)
     for epoch in progress:
         model.train()
         total_loss = 0.0

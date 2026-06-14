@@ -1,10 +1,10 @@
 {
   "dataset": "mosi",
-  "data_file": "E:\\Xu\\data\\CMU_MOSI\\mosi_aligned.npz",
+  "data_file": "E:\\Xu\\data\\MultiBench\\mosi\\mosi_aligned.npz",
   "label_rule": {
     "negative": "label < -0.5",
     "neutral": "-0.5 <= label <= 0.5",
     "positive": "label > 0.5"
   },
-  "default_command": "python code/disagreement_phenomenon/scripts/run_phenomenon.py --dataset mosi --data_root E:\\Xu\\data"
+  "default_command": "python code/disagreement_phenomenon/scripts/run_phenomenon.py --dataset mosi --data_root E:\\Xu\\data\\MultiBench"
 }

@@ -30,12 +30,12 @@ class DatasetConfig:
 DATASETS = {
     "mosi": DatasetConfig(
         name="mosi",
-        folder="CMU_MOSI",
+        folder="mosi",
         filename="mosi_aligned.npz",
     ),
     "mosei": DatasetConfig(
         name="mosei",
-        folder="CMU_MOSEI",
+        folder="mosei",
         filename="mosei_aligned.npz",
     ),
 }
@@ -59,6 +59,7 @@ class ExperimentConfig:
     )
     patience: int = 8
     num_workers: int = 0
+    quiet: bool = False
 
     @property
     def dataset_config(self) -> DatasetConfig:
@@ -71,4 +72,3 @@ class ExperimentConfig:
     def data_path(self) -> Path:
         ds = self.dataset_config
         return self.data_root / ds.folder / ds.filename
-

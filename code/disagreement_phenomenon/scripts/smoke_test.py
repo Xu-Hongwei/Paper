@@ -6,6 +6,7 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -51,7 +52,7 @@ def make_fixture(path: Path) -> None:
 def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
-        data_dir = root / "CMU_MOSI"
+        data_dir = root / "mosi"
         data_dir.mkdir(parents=True)
         make_fixture(data_dir / "mosi_aligned.npz")
         output_root = root / "outputs"
@@ -92,12 +93,36 @@ def main() -> int:
             "test_groups.csv",
             "group_metrics.csv",
             "delta_metrics.csv",
+            "high_d_reliability_metrics.csv",
+            "high_d_reliability_delta.csv",
+            "lambda_test_delta_metrics.csv",
+            "lambda_high_d_reliability_delta.csv",
             "delta_macro_f1.png",
+            "lambda_delta_macro_f1_curve.png",
             "summary.json",
         ]
         missing = [name for name in required if not (latest / name).exists()]
         if missing:
             print(f"Smoke test failed: missing outputs {missing}", file=sys.stderr)
+            return 1
+        groups = pd.read_csv(latest / "test_groups.csv")
+        required_columns = {
+            "R_text",
+            "R_vision",
+            "R_audio",
+            "R_sample",
+            "high_d_reliability_group",
+        }
+        missing_columns = sorted(required_columns - set(groups.columns))
+        if missing_columns:
+            print(
+                f"Smoke test failed: missing test_groups columns {missing_columns}",
+                file=sys.stderr,
+            )
+            return 1
+        high_d_groups = set(groups.loc[groups["group"] == "High-D", "high_d_reliability_group"])
+        if not high_d_groups.intersection({"High-D+Low-R", "High-D+High-R"}):
+            print("Smoke test failed: High-D reliability split is empty.", file=sys.stderr)
             return 1
         print(f"Smoke test passed. Outputs checked in {latest}")
         return 0

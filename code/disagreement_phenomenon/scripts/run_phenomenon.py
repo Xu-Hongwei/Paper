@@ -16,15 +16,18 @@ if str(ROOT) not in sys.path:
 from src.config import DATASETS, ExperimentConfig  # noqa: E402
 from src.data import MultimodalSplitDataset, infer_input_dims, load_npz_splits  # noqa: E402
 from src.disagreement import (  # noqa: E402
+    HIGH_D_RELIABILITY_GROUP_ORDER,
+    assign_high_d_reliability_groups,
     build_group_frame,
     grouped_metrics,
     rows_for_method,
     sample_disagreement,
+    sample_reliability,
     validation_thresholds,
     assign_groups,
 )
 from src.model import MultimodalClassifier  # noqa: E402
-from src.plotting import save_delta_plot  # noqa: E402
+from src.plotting import save_delta_plot, save_lambda_curve_plot  # noqa: E402
 from src.train import predict, train_model  # noqa: E402
 from src.utils import choose_device, ensure_dir, save_json, set_seed  # noqa: E402
 
@@ -34,7 +37,7 @@ def parse_args() -> argparse.Namespace:
         description="Run the CMU-MOSI/MOSEI disagreement phenomenon experiment."
     )
     parser.add_argument("--dataset", choices=sorted(DATASETS), required=True)
-    parser.add_argument("--data_root", type=Path, default=Path(r"E:\Xu\data"))
+    parser.add_argument("--data_root", type=Path, default=Path(r"E:\Xu\data\MultiBench"))
     parser.add_argument(
         "--output_root",
         type=Path,
@@ -43,6 +46,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
@@ -56,6 +60,11 @@ def parse_args() -> argparse.Namespace:
         default=[0.01, 0.05, 0.1, 0.5],
     )
     parser.add_argument("--patience", type=int, default=8)
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Disable per-epoch tqdm progress bars.",
+    )
     return parser.parse_args()
 
 
@@ -116,6 +125,7 @@ def train_concat(
         lambda_align=0.0,
         patience=cfg.patience,
         desc="Concat",
+        show_progress=not cfg.quiet,
     )
 
 
@@ -138,6 +148,7 @@ def train_diagnostic(
         lambda_align=0.0,
         patience=cfg.patience,
         desc="Diagnostic",
+        show_progress=not cfg.quiet,
     )
 
 
@@ -146,12 +157,29 @@ def train_best_alignment(
     loaders: dict[str, DataLoader],
     cfg: ExperimentConfig,
     device: torch.device,
-) -> tuple[MultimodalClassifier, dict[str, float], float, list[dict[str, float]]]:
+    concat_grouped: dict[str, dict[str, float]],
+    concat_reliability_grouped: dict[str, dict[str, float]],
+    test_groups,
+    test_reliability_groups,
+) -> tuple[
+    MultimodalClassifier,
+    dict[str, float],
+    float,
+    list[dict[str, float]],
+    dict[str, dict[str, float]],
+    dict[str, dict[str, float]],
+    list[dict[str, float]],
+    list[dict[str, float]],
+]:
     best_model: MultimodalClassifier | None = None
     best_metrics: dict[str, float] = {}
+    best_grouped: dict[str, dict[str, float]] = {}
+    best_reliability_grouped: dict[str, dict[str, float]] = {}
     best_lambda = cfg.lambda_align_values[0]
     best_score = -1.0
     sweep_rows: list[dict[str, float]] = []
+    lambda_delta_rows: list[dict[str, float]] = []
+    lambda_reliability_delta_rows: list[dict[str, float]] = []
 
     for lambda_align in cfg.lambda_align_values:
         model = new_model(input_dims, cfg)
@@ -167,18 +195,79 @@ def train_best_alignment(
             lambda_align=lambda_align,
             patience=cfg.patience,
             desc=f"Align λ={lambda_align}",
+            show_progress=not cfg.quiet,
         )
         score = metrics.get("macro_f1", -1.0)
         sweep_rows.append({"lambda_align": lambda_align, **metrics})
+
+        align_pred = predict(trained, loaders["test"], device)
+        align_grouped = grouped_metrics(
+            align_pred["y_true"],
+            align_pred["y_pred"],
+            test_groups,
+        )
+        align_reliability_grouped = grouped_metrics(
+            align_pred["y_true"],
+            align_pred["y_pred"],
+            test_reliability_groups,
+            group_order=HIGH_D_RELIABILITY_GROUP_ORDER,
+            include_overall=False,
+        )
+        for group in ("Low-D", "Mid-D", "High-D", "Overall"):
+            lambda_delta_rows.append(
+                {
+                    "lambda_align": lambda_align,
+                    "group": group,
+                    "n": align_grouped[group]["n"],
+                    "concat_acc": concat_grouped[group]["acc"],
+                    "align_acc": align_grouped[group]["acc"],
+                    "delta_acc": align_grouped[group]["acc"] - concat_grouped[group]["acc"],
+                    "concat_macro_f1": concat_grouped[group]["macro_f1"],
+                    "align_macro_f1": align_grouped[group]["macro_f1"],
+                    "delta_macro_f1": align_grouped[group]["macro_f1"]
+                    - concat_grouped[group]["macro_f1"],
+                    "valid_macro_f1": metrics.get("macro_f1"),
+                    "valid_acc": metrics.get("acc"),
+                }
+            )
+        for group in HIGH_D_RELIABILITY_GROUP_ORDER:
+            lambda_reliability_delta_rows.append(
+                {
+                    "lambda_align": lambda_align,
+                    "group": group,
+                    "n": align_reliability_grouped[group]["n"],
+                    "concat_acc": concat_reliability_grouped[group]["acc"],
+                    "align_acc": align_reliability_grouped[group]["acc"],
+                    "delta_acc": align_reliability_grouped[group]["acc"]
+                    - concat_reliability_grouped[group]["acc"],
+                    "concat_macro_f1": concat_reliability_grouped[group]["macro_f1"],
+                    "align_macro_f1": align_reliability_grouped[group]["macro_f1"],
+                    "delta_macro_f1": align_reliability_grouped[group]["macro_f1"]
+                    - concat_reliability_grouped[group]["macro_f1"],
+                    "valid_macro_f1": metrics.get("macro_f1"),
+                    "valid_acc": metrics.get("acc"),
+                }
+            )
         if score > best_score:
             best_score = score
             best_model = trained
             best_metrics = metrics
+            best_grouped = align_grouped
+            best_reliability_grouped = align_reliability_grouped
             best_lambda = lambda_align
 
     if best_model is None:
         raise RuntimeError("Alignment sweep did not train any model.")
-    return best_model, best_metrics, best_lambda, sweep_rows
+    return (
+        best_model,
+        best_metrics,
+        best_lambda,
+        sweep_rows,
+        best_grouped,
+        best_reliability_grouped,
+        lambda_delta_rows,
+        lambda_reliability_delta_rows,
+    )
 
 
 def main() -> int:
@@ -189,6 +278,7 @@ def main() -> int:
         output_root=args.output_root,
         seed=args.seed,
         batch_size=args.batch_size,
+        num_workers=args.num_workers,
         epochs=args.epochs,
         lr=args.lr,
         weight_decay=args.weight_decay,
@@ -197,6 +287,7 @@ def main() -> int:
         eta_unimodal=args.eta_unimodal,
         lambda_align_values=args.lambda_align_values,
         patience=args.patience,
+        quiet=args.quiet,
     )
 
     set_seed(cfg.seed)
@@ -229,6 +320,7 @@ def main() -> int:
             "data_path": str(cfg.data_path),
             "seed": cfg.seed,
             "batch_size": cfg.batch_size,
+            "num_workers": cfg.num_workers,
             "epochs": cfg.epochs,
             "lr": cfg.lr,
             "weight_decay": cfg.weight_decay,
@@ -237,6 +329,7 @@ def main() -> int:
             "eta_unimodal": cfg.eta_unimodal,
             "lambda_align_values": cfg.lambda_align_values,
             "input_dims": input_dims,
+            "quiet": cfg.quiet,
         },
     )
 
@@ -251,19 +344,52 @@ def main() -> int:
     )
     q33, q66 = validation_thresholds(valid_d)
     test_groups = assign_groups(test_d, q33, q66)
-    group_df = build_group_frame(test_diag, test_d, test_groups)
+    test_reliability = sample_reliability(
+        test_diag["prob_t"], test_diag["prob_v"], test_diag["prob_a"]
+    )
+    test_reliability_groups = assign_high_d_reliability_groups(
+        test_groups,
+        test_reliability["R_sample"],
+    )
+    group_df = build_group_frame(
+        test_diag,
+        test_d,
+        test_groups,
+        reliability=test_reliability,
+        reliability_groups=test_reliability_groups,
+    )
     group_df.to_csv(run_dir / "test_groups.csv", index=False, encoding="utf-8-sig")
 
     concat_model, concat_valid = train_concat(input_dims, loaders, cfg, device)
-    align_model, align_valid, best_lambda, sweep_rows = train_best_alignment(
-        input_dims, loaders, cfg, device
+    concat_pred = predict(concat_model, loaders["test"], device)
+    concat_grouped = grouped_metrics(concat_pred["y_true"], concat_pred["y_pred"], test_groups)
+    concat_reliability_grouped = grouped_metrics(
+        concat_pred["y_true"],
+        concat_pred["y_pred"],
+        test_reliability_groups,
+        group_order=HIGH_D_RELIABILITY_GROUP_ORDER,
+        include_overall=False,
     )
 
-    concat_pred = predict(concat_model, loaders["test"], device)
-    align_pred = predict(align_model, loaders["test"], device)
-
-    concat_grouped = grouped_metrics(concat_pred["y_true"], concat_pred["y_pred"], test_groups)
-    align_grouped = grouped_metrics(align_pred["y_true"], align_pred["y_pred"], test_groups)
+    (
+        align_model,
+        align_valid,
+        best_lambda,
+        sweep_rows,
+        align_grouped,
+        align_reliability_grouped,
+        lambda_delta_rows,
+        lambda_reliability_delta_rows,
+    ) = train_best_alignment(
+        input_dims,
+        loaders,
+        cfg,
+        device,
+        concat_grouped,
+        concat_reliability_grouped,
+        test_groups,
+        test_reliability_groups,
+    )
 
     rows = []
     rows.extend(rows_for_method("Concat", concat_grouped))
@@ -287,7 +413,66 @@ def main() -> int:
     pd.DataFrame(sweep_rows).to_csv(
         run_dir / "lambda_sweep_valid.csv", index=False, encoding="utf-8-sig"
     )
+    lambda_delta_df = pd.DataFrame(lambda_delta_rows)
+    lambda_delta_df.to_csv(
+        run_dir / "lambda_test_delta_metrics.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    lambda_reliability_delta_df = pd.DataFrame(lambda_reliability_delta_rows)
+    lambda_reliability_delta_df.to_csv(
+        run_dir / "lambda_high_d_reliability_delta.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
     save_delta_plot(delta_df, run_dir / "delta_macro_f1.png")
+    save_lambda_curve_plot(
+        lambda_delta_df,
+        run_dir / "lambda_delta_macro_f1_curve.png",
+    )
+
+    reliability_rows = []
+    reliability_rows.extend(
+        rows_for_method(
+            "Concat",
+            concat_reliability_grouped,
+            group_order=HIGH_D_RELIABILITY_GROUP_ORDER,
+            include_overall=False,
+        )
+    )
+    reliability_rows.extend(
+        rows_for_method(
+            "UncondAlign",
+            align_reliability_grouped,
+            lambda_align=best_lambda,
+            group_order=HIGH_D_RELIABILITY_GROUP_ORDER,
+            include_overall=False,
+        )
+    )
+    reliability_results_df = pd.DataFrame(reliability_rows)
+    reliability_results_df.to_csv(
+        run_dir / "high_d_reliability_metrics.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    reliability_delta_rows = []
+    for group in HIGH_D_RELIABILITY_GROUP_ORDER:
+        reliability_delta_rows.append(
+            {
+                "group": group,
+                "delta_acc": align_reliability_grouped[group]["acc"]
+                - concat_reliability_grouped[group]["acc"],
+                "delta_macro_f1": align_reliability_grouped[group]["macro_f1"]
+                - concat_reliability_grouped[group]["macro_f1"],
+                "lambda_align": best_lambda,
+            }
+        )
+    reliability_delta_df = pd.DataFrame(reliability_delta_rows)
+    reliability_delta_df.to_csv(
+        run_dir / "high_d_reliability_delta.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
 
     torch.save(diagnostic_model.state_dict(), run_dir / "diagnostic_model.pt")
     torch.save(concat_model.state_dict(), run_dir / "concat_model.pt")
@@ -300,6 +485,10 @@ def main() -> int:
             "uncond_align_valid": align_valid,
             "best_lambda_align": best_lambda,
             "thresholds": {"q33": q33, "q66": q66},
+            "high_d_reliability_counts": {
+                group: int((test_reliability_groups == group).sum())
+                for group in HIGH_D_RELIABILITY_GROUP_ORDER
+            },
         },
     )
 
@@ -307,6 +496,8 @@ def main() -> int:
     print(results_df.to_string(index=False))
     print("\nDelta metrics:")
     print(delta_df.to_string(index=False))
+    print("\nHigh-D reliability delta metrics:")
+    print(reliability_delta_df.to_string(index=False))
     print(f"\nSaved outputs to: {run_dir}")
     return 0
 

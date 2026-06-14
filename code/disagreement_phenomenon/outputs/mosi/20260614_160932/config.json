@@ -1,0 +1,20 @@
+{
+  "dataset": "mosi",
+  "data_path": "E:\\Xu\\data\\CMU_MOSI\\mosi_aligned.npz",
+  "seed": 42,
+  "batch_size": 64,
+  "epochs": 1,
+  "lr": 0.001,
+  "weight_decay": 0.0001,
+  "hidden_dim": 128,
+  "dropout": 0.2,
+  "eta_unimodal": 0.3,
+  "lambda_align_values": [
+    0.01
+  ],
+  "input_dims": {
+    "text": 300,
+    "vision": 35,
+    "audio": 74
+  }
+}

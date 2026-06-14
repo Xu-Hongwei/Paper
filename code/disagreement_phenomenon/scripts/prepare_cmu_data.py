@@ -12,6 +12,9 @@ from tqdm import tqdm
 from urllib3.util.retry import Retry
 
 
+HDF5_MAGIC = b"\x89HDF\r\n\x1a\n"
+
+
 def avg(intervals: np.ndarray, features: np.ndarray) -> np.ndarray:
     del intervals
     return np.asarray(features, dtype=np.float32).mean(axis=0)
@@ -19,7 +22,7 @@ def avg(intervals: np.ndarray, features: np.ndarray) -> np.ndarray:
 
 DATASET_SPECS = {
     "mosi": {
-        "folder": "CMU_MOSI",
+        "folder": "mosi",
         "filename": "mosi_aligned.npz",
         "sdk_name": "cmu_mosi",
         "label_key": "Opinion Segment Labels",
@@ -28,7 +31,7 @@ DATASET_SPECS = {
         "audio_key": "COVAREP",
     },
     "mosei": {
-        "folder": "CMU_MOSEI",
+        "folder": "mosei",
         "filename": "mosei_aligned.npz",
         "sdk_name": "cmu_mosei",
         "label_key": "All Labels",
@@ -55,8 +58,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--data_root",
         type=Path,
-        default=Path(r"E:\Xu\data"),
-        help="Download/export root directory.",
+        default=Path(r"E:\Xu\data\MultiBench"),
+        help="Download/export root MultiBench directory.",
     )
     parser.add_argument(
         "--label_index",
@@ -240,6 +243,15 @@ def download_csd(
             f"Incomplete download for {url}: got {written} bytes, expected {total} bytes."
         )
 
+    with tmp_path.open("rb") as handle:
+        magic = handle.read(len(HDF5_MAGIC))
+    if magic != HDF5_MAGIC:
+        tmp_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"Downloaded file from {url} is not a valid HDF5/CSD file. "
+            "The server may have returned an error page or proxy response."
+        )
+
     tmp_path.replace(destination)
     return destination
 
@@ -269,12 +281,13 @@ def localize_recipe(
                     force_download=force_download,
                 )
             )
-        except requests.RequestException as exc:
+        except (requests.RequestException, RuntimeError, ValueError) as exc:
             raise RuntimeError(
                 f"Failed to download {key} from {url}\n"
                 "This is usually a CMU data-server/network issue. "
                 "Re-run the same command later; already downloaded .csd files "
-                "will be reused.\n"
+                "will be reused. For Experiment 1, the more reliable route is "
+                "to use MultiBench processed pickles via prepare_multibench_data.py.\n"
                 f"Original error: {exc}"
             ) from exc
     return localized

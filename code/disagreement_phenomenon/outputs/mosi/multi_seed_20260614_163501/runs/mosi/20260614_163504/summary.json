@@ -1,0 +1,26 @@
+{
+  "diagnostic_valid": {
+    "epoch": 16.0,
+    "acc": 0.6635514018691588,
+    "macro_f1": 0.5812208302628347
+  },
+  "concat_valid": {
+    "epoch": 16.0,
+    "acc": 0.6588785046728972,
+    "macro_f1": 0.5524111491853427
+  },
+  "uncond_align_valid": {
+    "epoch": 29.0,
+    "acc": 0.6401869158878505,
+    "macro_f1": 0.5638640598700243
+  },
+  "best_lambda_align": 0.05,
+  "thresholds": {
+    "q33": 0.022366158664226532,
+    "q66": 0.05171915516257286
+  },
+  "high_d_reliability_counts": {
+    "High-D+Low-R": 127,
+    "High-D+High-R": 128
+  }
+}
