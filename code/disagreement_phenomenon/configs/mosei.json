@@ -1,0 +1,10 @@
+{
+  "dataset": "mosei",
+  "data_file": "E:\\Xu\\data\\CMU_MOSEI\\mosei_aligned.npz",
+  "label_rule": {
+    "negative": "label < -0.5",
+    "neutral": "-0.5 <= label <= 0.5",
+    "positive": "label > 0.5"
+  },
+  "default_command": "python code/disagreement_phenomenon/scripts/run_phenomenon.py --dataset mosei --data_root E:\\Xu\\data"
+}
