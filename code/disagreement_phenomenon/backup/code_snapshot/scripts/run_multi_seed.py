@@ -42,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--hidden_dim", type=int, default=128)
     parser.add_argument("--dropout", type=float, default=0.2)
-    parser.add_argument("--eta_unimodal", type=float, default=0.1)
+    parser.add_argument("--eta_unimodal", type=float, default=0.3)
     parser.add_argument(
         "--lambda_align_values",
         type=float,
@@ -54,27 +54,6 @@ def parse_args() -> argparse.Namespace:
         type=float,
         nargs="+",
         default=[0.1, 0.3, 0.5, 1.0],
-    )
-    parser.add_argument(
-        "--pair_mode",
-        choices=("text_anchor", "full_pair"),
-        default=None,
-        help=(
-            "Unified pair graph for every seed. text_anchor uses T-A/T-V; "
-            "full_pair also uses A-V."
-        ),
-    )
-    parser.add_argument(
-        "--align_pair_mode",
-        choices=("text_anchor", "full_pair"),
-        default=None,
-        help="Deprecated override for UncondAlign; must match --pair_mode when set.",
-    )
-    parser.add_argument(
-        "--direct_add_pair_mode",
-        choices=("text_anchor", "full_pair"),
-        default=None,
-        help="Deprecated override for DirectAdd; must match --pair_mode when set.",
     )
     parser.add_argument(
         "--run_infonce",
@@ -91,8 +70,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--nce_pair_mode",
         choices=("text_anchor", "full_pair"),
-        default=None,
-        help="Deprecated override for InfoNCE; must match --pair_mode when set.",
+        default="text_anchor",
     )
     parser.add_argument(
         "--disagreement_metric",
@@ -102,24 +80,50 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--disagreement_pair_mode",
         choices=("text_anchor", "full_pair"),
-        default=None,
-        help="Deprecated override for prob_jsd D_sample; must match --pair_mode when set.",
+        default="text_anchor",
     )
     parser.add_argument("--kernel_bandwidth", default="median")
     parser.add_argument(
         "--kernel_pair_mode",
         choices=("text_anchor", "full_pair"),
-        default=None,
-        help="Deprecated override for kernel D_sample; must match --pair_mode when set.",
+        default="text_anchor",
     )
     parser.add_argument("--kernel_class_weight", type=float, default=0.5)
     parser.add_argument("--kernel_max_class_samples", type=int, default=1024)
     parser.add_argument(
+        "--run_copa",
+        action="store_true",
+        help="Train and aggregate the label-aware CoPA prototype model.",
+    )
+    parser.add_argument(
+        "--lambda_copa_values",
+        type=float,
+        nargs="+",
+        default=[0.01, 0.05, 0.1],
+    )
+    parser.add_argument(
         "--tau_agreement",
         type=float,
         default=0.1,
-        help="Temperature for diagnostic A_ij = exp(-D_ij/tau_agreement).",
+        help="Temperature for common/residual NCE and full_relation agreement gates.",
     )
+    parser.add_argument("--copa_proto_weight", type=float, default=1.0)
+    parser.add_argument("--copa_agr_weight", type=float, default=1.0)
+    parser.add_argument("--copa_comp_weight", type=float, default=0.5)
+    parser.add_argument("--copa_comp_margin", type=float, default=0.2)
+    parser.add_argument("--copa_orth_weight", type=float, default=0.01)
+    parser.add_argument(
+        "--copa_gate_type",
+        choices=("label_support", "full_relation"),
+        default="label_support",
+    )
+    parser.add_argument(
+        "--copa_gate_metric",
+        choices=("prob_jsd", "kernel_mmd"),
+        default="prob_jsd",
+        help="Distance metric used by --copa_gate_type full_relation.",
+    )
+    parser.add_argument("--copa_kernel_bandwidth", default="median")
     parser.add_argument("--patience", type=int, default=8)
     parser.add_argument(
         "--deterministic",
@@ -143,38 +147,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Pass --quiet to each single-seed run.",
     )
-    args = parser.parse_args()
-    resolve_pair_modes(args, parser)
-    return args
-
-
-def resolve_pair_modes(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
-    specific_names = (
-        "align_pair_mode",
-        "direct_add_pair_mode",
-        "nce_pair_mode",
-        "disagreement_pair_mode",
-        "kernel_pair_mode",
-    )
-    explicit_modes = {
-        getattr(args, name) for name in specific_names if getattr(args, name) is not None
-    }
-    if args.pair_mode is None:
-        if len(explicit_modes) > 1:
-            parser.error(
-                "Pair-mode arguments conflict. Use a single --pair_mode, or make all "
-                "specific *_pair_mode arguments identical."
-            )
-        args.pair_mode = next(iter(explicit_modes), "text_anchor")
-    for name in specific_names:
-        value = getattr(args, name)
-        if value is None:
-            setattr(args, name, args.pair_mode)
-        elif value != args.pair_mode:
-            parser.error(
-                f"--{name}={value} conflicts with --pair_mode={args.pair_mode}. "
-                "Use one consistent pair mode for the whole run."
-            )
+    return parser.parse_args()
 
 
 def newest_run_dir(run_root: Path, dataset: str, seen: set[Path]) -> Path:
@@ -390,12 +363,6 @@ def run_one_seed(args: argparse.Namespace, run_root: Path, seed: int, seen: set[
         *[str(value) for value in args.lambda_align_values],
         "--direct_add_alpha_values",
         *[str(value) for value in args.direct_add_alpha_values],
-        "--pair_mode",
-        args.pair_mode,
-        "--align_pair_mode",
-        args.align_pair_mode,
-        "--direct_add_pair_mode",
-        args.direct_add_pair_mode,
         "--disagreement_metric",
         args.disagreement_metric,
         "--disagreement_pair_mode",
@@ -421,6 +388,30 @@ def run_one_seed(args: argparse.Namespace, run_root: Path, seed: int, seen: set[
                 str(args.nce_temperature),
                 "--nce_pair_mode",
                 args.nce_pair_mode,
+            ]
+        )
+    if args.run_copa:
+        command.extend(
+            [
+                "--run_copa",
+                "--lambda_copa_values",
+                *[str(value) for value in args.lambda_copa_values],
+                "--copa_proto_weight",
+                str(args.copa_proto_weight),
+                "--copa_agr_weight",
+                str(args.copa_agr_weight),
+                "--copa_comp_weight",
+                str(args.copa_comp_weight),
+                "--copa_comp_margin",
+                str(args.copa_comp_margin),
+                "--copa_orth_weight",
+                str(args.copa_orth_weight),
+                "--copa_gate_type",
+                args.copa_gate_type,
+                "--copa_gate_metric",
+                args.copa_gate_metric,
+                "--copa_kernel_bandwidth",
+                str(args.copa_kernel_bandwidth),
             ]
         )
     if args.quiet:
@@ -458,9 +449,6 @@ def main() -> int:
             "eta_unimodal": args.eta_unimodal,
             "lambda_align_values": args.lambda_align_values,
             "direct_add_alpha_values": args.direct_add_alpha_values,
-            "pair_mode": args.pair_mode,
-            "align_pair_mode": args.align_pair_mode,
-            "direct_add_pair_mode": args.direct_add_pair_mode,
             "run_infonce": args.run_infonce,
             "lambda_nce_values": args.lambda_nce_values,
             "nce_temperature": args.nce_temperature,
@@ -471,7 +459,17 @@ def main() -> int:
             "kernel_pair_mode": args.kernel_pair_mode,
             "kernel_class_weight": args.kernel_class_weight,
             "kernel_max_class_samples": args.kernel_max_class_samples,
+            "run_copa": args.run_copa,
+            "lambda_copa_values": args.lambda_copa_values,
             "tau_agreement": args.tau_agreement,
+            "copa_proto_weight": args.copa_proto_weight,
+            "copa_agr_weight": args.copa_agr_weight,
+            "copa_comp_weight": args.copa_comp_weight,
+            "copa_comp_margin": args.copa_comp_margin,
+            "copa_orth_weight": args.copa_orth_weight,
+            "copa_gate_type": args.copa_gate_type,
+            "copa_gate_metric": args.copa_gate_metric,
+            "copa_kernel_bandwidth": args.copa_kernel_bandwidth,
             "patience": args.patience,
             "deterministic": args.deterministic,
             "error_min_seeds": args.error_min_seeds,
@@ -501,7 +499,14 @@ def main() -> int:
         "direct_add_relation_state_delta.csv",
     )
     concat_aware_all = read_seed_csv(run_dirs, "concat_aware_motivation.csv")
+    feature_consistency_all = read_seed_csv(run_dirs, "feature_consistency_diagnostic.csv")
+    residual_diagnostic_all = read_seed_csv(run_dirs, "residual_distribution_diagnostic.csv")
     residual_probe_all = read_seed_csv(run_dirs, "residual_discriminative_probe.csv")
+    selective_prototype_all = read_seed_csv(
+        run_dirs,
+        "selective_agreement_prototype_check.csv",
+    )
+    label_aware_relation_all = read_seed_csv(run_dirs, "label_aware_relation_summary.csv")
     lambda_delta_all = read_seed_csv(run_dirs, "lambda_test_delta_metrics.csv")
     lambda_reliability_delta_all = read_seed_csv(
         run_dirs,
@@ -530,6 +535,30 @@ def main() -> int:
             run_dirs,
             "infonce_lambda_high_d_reliability_delta.csv",
         )
+    copa_delta_all = pd.DataFrame()
+    copa_reliability_delta_all = pd.DataFrame()
+    copa_relation_state_delta_all = pd.DataFrame()
+    copa_lambda_delta_all = pd.DataFrame()
+    copa_lambda_reliability_delta_all = pd.DataFrame()
+    if args.run_copa:
+        copa_delta_all = read_seed_csv(run_dirs, "copa_delta_metrics.csv")
+        copa_reliability_delta_all = read_seed_csv(
+            run_dirs,
+            "copa_high_d_reliability_delta.csv",
+        )
+        copa_relation_state_delta_all = read_seed_csv(
+            run_dirs,
+            "copa_relation_state_delta.csv",
+        )
+        copa_lambda_delta_all = read_seed_csv(
+            run_dirs,
+            "copa_lambda_test_delta_metrics.csv",
+        )
+        copa_lambda_reliability_delta_all = read_seed_csv(
+            run_dirs,
+            "copa_lambda_high_d_reliability_delta.csv",
+        )
+
     delta_all.to_csv(summary_dir / "multi_seed_delta_all.csv", index=False, encoding="utf-8-sig")
     group_all.to_csv(
         summary_dir / "multi_seed_group_metrics_all.csv",
@@ -576,8 +605,28 @@ def main() -> int:
         index=False,
         encoding="utf-8-sig",
     )
+    feature_consistency_all.to_csv(
+        summary_dir / "feature_consistency_diagnostic_all.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    residual_diagnostic_all.to_csv(
+        summary_dir / "residual_distribution_diagnostic_all.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
     residual_probe_all.to_csv(
         summary_dir / "residual_discriminative_probe_all.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    selective_prototype_all.to_csv(
+        summary_dir / "selective_agreement_prototype_check_all.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    label_aware_relation_all.to_csv(
+        summary_dir / "label_aware_relation_summary_all.csv",
         index=False,
         encoding="utf-8-sig",
     )
@@ -617,6 +666,33 @@ def main() -> int:
             index=False,
             encoding="utf-8-sig",
         )
+    if args.run_copa:
+        copa_delta_all.to_csv(
+            summary_dir / "copa_delta_all.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        copa_reliability_delta_all.to_csv(
+            summary_dir / "copa_high_d_reliability_delta_all.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        copa_relation_state_delta_all.to_csv(
+            summary_dir / "copa_relation_state_delta_all.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        copa_lambda_delta_all.to_csv(
+            summary_dir / "copa_lambda_test_delta_all.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        copa_lambda_reliability_delta_all.to_csv(
+            summary_dir / "copa_lambda_high_d_reliability_delta_all.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+
     delta_summary = flatten_summary(
         delta_all,
         ["group"],
@@ -689,14 +765,20 @@ def main() -> int:
             "text_anchor_residual_gain_macro_f1",
             "shuffled_residual_only_macro_f1",
             "text_anchor_shuffled_residual_macro_f1",
-            "common_shuffled_residual_macro_f1",
-            "residual_gain_vs_feature_shuffle_macro_f1",
-            "text_anchor_common_shuffled_residual_macro_f1",
-            "text_anchor_residual_gain_vs_feature_shuffle_macro_f1",
             "lambda_align",
             "direct_add_alpha",
             "lambda_nce",
         ],
+    )
+    feature_consistency_summary = flatten_summary(
+        feature_consistency_all,
+        ["group"],
+        ["n", "avg_Dpred", "avg_Dfeat", "spearman_Dpred_Dfeat"],
+    )
+    residual_diagnostic_summary = flatten_summary(
+        residual_diagnostic_all,
+        ["group"],
+        ["n", "avg_Dpred", "avg_Dfeat", "residual_dist", "residual_sep"],
     )
     residual_probe_summary = flatten_summary(
         residual_probe_all,
@@ -713,10 +795,17 @@ def main() -> int:
             "text_anchor_common_residual_macro_f1",
             "text_anchor_residual_gain_macro_f1",
             "text_anchor_shuffled_residual_macro_f1",
-            "common_shuffled_residual_macro_f1",
-            "residual_gain_vs_feature_shuffle_macro_f1",
-            "text_anchor_common_shuffled_residual_macro_f1",
-            "text_anchor_residual_gain_vs_feature_shuffle_macro_f1",
+        ],
+    )
+    selective_prototype_summary = flatten_summary(
+        selective_prototype_all,
+        ["prototype", "eval_group"],
+        [
+            "train_n",
+            "prototype_purity",
+            "intra_class_compactness",
+            "nearest_proto_acc",
+            "nearest_proto_macro_f1",
         ],
     )
     lambda_delta_summary = flatten_summary(
@@ -781,6 +870,63 @@ def main() -> int:
             min_count=args.error_min_seeds,
             sign_rate_threshold=args.error_sign_rate,
         )
+    relation_value_cols = [
+        column
+        for column in label_aware_relation_all.columns
+        if column not in {"seed", "run_dir", "split"}
+    ]
+    label_aware_relation_summary = flatten_summary(
+        label_aware_relation_all,
+        ["split"],
+        relation_value_cols,
+    )
+    copa_delta_summary = pd.DataFrame()
+    copa_reliability_summary = pd.DataFrame()
+    copa_relation_state_summary = pd.DataFrame()
+    copa_lambda_delta_summary = pd.DataFrame()
+    copa_lambda_reliability_summary = pd.DataFrame()
+    if args.run_copa:
+        copa_delta_summary = flatten_summary(
+            copa_delta_all,
+            ["group"],
+            ["delta_acc", "delta_macro_f1", "lambda_copa"],
+            sign_cols=["delta_acc", "delta_macro_f1"],
+            min_count=args.error_min_seeds,
+            sign_rate_threshold=args.error_sign_rate,
+        )
+        copa_reliability_summary = flatten_summary(
+            copa_reliability_delta_all,
+            ["group"],
+            ["delta_acc", "delta_macro_f1", "lambda_copa"],
+            sign_cols=["delta_acc", "delta_macro_f1"],
+            min_count=args.error_min_seeds,
+            sign_rate_threshold=args.error_sign_rate,
+        )
+        copa_relation_state_summary = flatten_summary(
+            copa_relation_state_delta_all,
+            ["group"],
+            ["delta_acc", "delta_macro_f1", "lambda_copa"],
+            sign_cols=["delta_acc", "delta_macro_f1"],
+            min_count=args.error_min_seeds,
+            sign_rate_threshold=args.error_sign_rate,
+        )
+        copa_lambda_delta_summary = flatten_summary(
+            copa_lambda_delta_all,
+            ["lambda_copa", "group"],
+            ["delta_acc", "delta_macro_f1", "valid_macro_f1", "valid_acc"],
+            sign_cols=["delta_acc", "delta_macro_f1"],
+            min_count=args.error_min_seeds,
+            sign_rate_threshold=args.error_sign_rate,
+        )
+        copa_lambda_reliability_summary = flatten_summary(
+            copa_lambda_reliability_delta_all,
+            ["lambda_copa", "group"],
+            ["delta_acc", "delta_macro_f1", "valid_macro_f1", "valid_acc"],
+            sign_cols=["delta_acc", "delta_macro_f1"],
+            min_count=args.error_min_seeds,
+            sign_rate_threshold=args.error_sign_rate,
+        )
+
     delta_summary.to_csv(
         summary_dir / "multi_seed_delta_summary.csv",
         index=False,
@@ -826,8 +972,23 @@ def main() -> int:
         index=False,
         encoding="utf-8-sig",
     )
+    feature_consistency_summary.to_csv(
+        summary_dir / "feature_consistency_diagnostic_summary.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    residual_diagnostic_summary.to_csv(
+        summary_dir / "residual_distribution_diagnostic_summary.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
     residual_probe_summary.to_csv(
         summary_dir / "residual_discriminative_probe_summary.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    selective_prototype_summary.to_csv(
+        summary_dir / "selective_agreement_prototype_check_summary.csv",
         index=False,
         encoding="utf-8-sig",
     )
@@ -867,6 +1028,38 @@ def main() -> int:
             index=False,
             encoding="utf-8-sig",
         )
+    label_aware_relation_summary.to_csv(
+        summary_dir / "label_aware_relation_multi_seed_summary.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    if args.run_copa:
+        copa_delta_summary.to_csv(
+            summary_dir / "copa_delta_summary.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        copa_reliability_summary.to_csv(
+            summary_dir / "copa_high_d_reliability_summary.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        copa_relation_state_summary.to_csv(
+            summary_dir / "copa_relation_state_delta_summary.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        copa_lambda_delta_summary.to_csv(
+            summary_dir / "copa_lambda_test_delta_summary.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        copa_lambda_reliability_summary.to_csv(
+            summary_dir / "copa_lambda_high_d_reliability_summary.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+
     error_frames: list[tuple[str, pd.DataFrame, list[str]]] = [
         ("uncond_align_delta", delta_summary, ["group"]),
         ("uncond_align_high_d_reliability", reliability_summary, ["group"]),
@@ -891,6 +1084,20 @@ def main() -> int:
                     "lambda_nce_high_d_reliability",
                     infonce_lambda_reliability_summary,
                     ["lambda_nce", "group"],
+                ),
+            ]
+        )
+    if args.run_copa:
+        error_frames.extend(
+            [
+                ("copa_delta", copa_delta_summary, ["group"]),
+                ("copa_high_d_reliability", copa_reliability_summary, ["group"]),
+                ("copa_relation_state", copa_relation_state_summary, ["group"]),
+                ("lambda_copa_strength", copa_lambda_delta_summary, ["lambda_copa", "group"]),
+                (
+                    "lambda_copa_high_d_reliability",
+                    copa_lambda_reliability_summary,
+                    ["lambda_copa", "group"],
                 ),
             ]
         )
@@ -976,6 +1183,40 @@ def main() -> int:
             y_label="Delta Macro-F1 (UncondInfoNCE - Concat)",
             raw_frame=infonce_lambda_delta_all,
         )
+    if args.run_copa:
+        save_detailed_delta_plot(
+            copa_delta_all,
+            copa_delta_summary,
+            summary_dir / "copa_delta_macro_f1_detailed.png",
+            title="CoPA gain by disagreement group",
+            ylabel="Delta Macro-F1 (CoPA - Concat)",
+        )
+        save_detailed_delta_plot(
+            copa_reliability_delta_all,
+            copa_reliability_summary,
+            summary_dir / "copa_high_d_reliability_delta_detailed.png",
+            group_order=HIGH_D_RELIABILITY_GROUP_ORDER,
+            title="CoPA on High-D reliability split",
+            ylabel="Delta Macro-F1 (CoPA - Concat)",
+        )
+        save_detailed_delta_plot(
+            copa_relation_state_delta_all,
+            copa_relation_state_summary,
+            summary_dir / "copa_relation_state_delta_detailed.png",
+            group_order=RELATION_STATE_GROUP_ORDER,
+            title="CoPA by relation state",
+            ylabel="Delta Macro-F1 (CoPA - Concat)",
+        )
+        heatmap_summaries["CoPA"] = copa_relation_state_summary
+        save_lambda_curve_plot(
+            copa_lambda_delta_summary,
+            summary_dir / "copa_lambda_delta_macro_f1_curve.png",
+            title="Multi-seed CoPA strength curve",
+            x_col="lambda_copa",
+            x_label="lambda_copa",
+            y_label="Delta Macro-F1 (CoPA - Concat)",
+            raw_frame=copa_lambda_delta_all,
+        )
     save_method_relation_state_heatmap(
         heatmap_summaries,
         summary_dir / "relation_state_method_comparison_heatmap.png",
@@ -1001,6 +1242,11 @@ def main() -> int:
         print(infonce_delta_summary.to_string(index=False))
         print("\nInfoNCE lambda strength delta summary:")
         print(infonce_lambda_delta_summary.to_string(index=False))
+    if args.run_copa:
+        print("\nCoPA delta summary:")
+        print(copa_delta_summary.to_string(index=False))
+        print("\nCoPA lambda strength delta summary:")
+        print(copa_lambda_delta_summary.to_string(index=False))
     print(f"\nSaved multi-seed summary to: {summary_dir}")
     return 0
 

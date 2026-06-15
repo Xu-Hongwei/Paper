@@ -1,2 +1,1 @@
-"""Utilities for the CoPA disagreement phenomenon experiment."""
-
+"""Utilities for the disagreement motivation experiment."""

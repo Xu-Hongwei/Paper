@@ -29,6 +29,13 @@ def jsd(p: np.ndarray, q: np.ndarray, eps: float = 1e-8) -> np.ndarray:
     return 0.5 * _kl_div(p, m, eps=eps) + 0.5 * _kl_div(q, m, eps=eps)
 
 
+def sample_disagreement(prob_t: np.ndarray, prob_v: np.ndarray, prob_a: np.ndarray) -> np.ndarray:
+    d_tv = jsd(prob_t, prob_v)
+    d_ta = jsd(prob_t, prob_a)
+    d_va = jsd(prob_v, prob_a)
+    return (d_tv + d_ta + d_va) / 3.0
+
+
 def pairwise_disagreement(
     prob_t: np.ndarray,
     prob_v: np.ndarray,
@@ -254,33 +261,59 @@ def normalized_reliability(prob: np.ndarray, eps: float = 1e-8) -> np.ndarray:
     return 1.0 - entropy / np.log(prob.shape[-1])
 
 
+def label_support(prob: np.ndarray, labels: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    prob = np.clip(prob, eps, 1.0)
+    labels = np.asarray(labels, dtype=np.int64).reshape(-1)
+    if prob.shape[0] != labels.shape[0]:
+        raise ValueError(
+            f"prob has {prob.shape[0]} samples but labels has {labels.shape[0]} samples."
+        )
+    return prob[np.arange(labels.shape[0]), labels]
+
+
 def sample_reliability(
     prob_t: np.ndarray,
     prob_v: np.ndarray,
     prob_a: np.ndarray,
-    *,
-    pair_mode: str = "text_anchor",
 ) -> dict[str, np.ndarray]:
     r_text = normalized_reliability(prob_t)
     r_vision = normalized_reliability(prob_v)
     r_audio = normalized_reliability(prob_a)
-    r_tv = r_text * r_vision
-    r_ta = r_text * r_audio
-    r_va = r_vision * r_audio
-    if pair_mode == "text_anchor":
-        r_sample = (r_ta + r_tv) / 2.0
-    elif pair_mode == "full_pair":
-        r_sample = (r_ta + r_tv + r_va) / 3.0
-    else:
-        raise ValueError("pair_mode must be 'text_anchor' or 'full_pair'.")
+    r_sample = (r_text + r_vision + r_audio) / 3.0
     return {
         "R_text": r_text,
         "R_vision": r_vision,
         "R_audio": r_audio,
-        "R_tv": r_tv,
-        "R_ta": r_ta,
-        "R_va": r_va,
         "R_sample": r_sample,
+    }
+
+
+def label_aware_reliability(
+    prob_t: np.ndarray,
+    prob_v: np.ndarray,
+    prob_a: np.ndarray,
+    labels: np.ndarray,
+) -> dict[str, np.ndarray]:
+    c_text = normalized_reliability(prob_t)
+    c_vision = normalized_reliability(prob_v)
+    c_audio = normalized_reliability(prob_a)
+    s_text = label_support(prob_t, labels)
+    s_vision = label_support(prob_v, labels)
+    s_audio = label_support(prob_a, labels)
+    r_text = c_text * s_text
+    r_vision = c_vision * s_vision
+    r_audio = c_audio * s_audio
+    return {
+        "C_text": c_text,
+        "C_vision": c_vision,
+        "C_audio": c_audio,
+        "S_text": s_text,
+        "S_vision": s_vision,
+        "S_audio": s_audio,
+        "R_label_text": r_text,
+        "R_label_vision": r_vision,
+        "R_label_audio": r_audio,
+        "R_label_sample": (r_text + r_vision + r_audio) / 3.0,
     }
 
 
@@ -319,6 +352,148 @@ def relation_gates(
         "g_va_comp": products["va"] * (1.0 - agreements["A_va"]),
         "g_va_noise": 1.0 - products["va"],
     }
+
+
+def label_aware_relation_gates(
+    prob_t: np.ndarray,
+    prob_v: np.ndarray,
+    prob_a: np.ndarray,
+    reliability: dict[str, np.ndarray],
+    tau_agreement: float,
+    *,
+    distances: dict[str, np.ndarray] | None = None,
+) -> dict[str, np.ndarray]:
+    agreements = (
+        pairwise_agreement(prob_t, prob_v, prob_a, tau_agreement)
+        if distances is None
+        else agreement_from_distances(distances, tau_agreement)
+    )
+    c_text = reliability["C_text"]
+    c_vision = reliability["C_vision"]
+    c_audio = reliability["C_audio"]
+    s_text = reliability["S_text"]
+    s_vision = reliability["S_vision"]
+    s_audio = reliability["S_audio"]
+    q_tv = c_text * c_vision
+    q_ta = c_text * c_audio
+    q_va = c_vision * c_audio
+    b_tv = np.maximum(s_text, s_vision)
+    b_ta = np.maximum(s_text, s_audio)
+    b_va = np.maximum(s_vision, s_audio)
+    g_tv_dis = q_tv * b_tv * (1.0 - agreements["A_tv"])
+    g_ta_dis = q_ta * b_ta * (1.0 - agreements["A_ta"])
+    g_va_dis = q_va * b_va * (1.0 - agreements["A_va"])
+    return {
+        **agreements,
+        "B_tv_label": b_tv,
+        "B_ta_label": b_ta,
+        "B_va_label": b_va,
+        "g_tv_agr": q_tv * s_text * s_vision * agreements["A_tv"],
+        "g_tv_dis": g_tv_dis,
+        "g_tv_comp": g_tv_dis,
+        "g_tv_noise": 1.0 - q_tv,
+        "g_ta_agr": q_ta * s_text * s_audio * agreements["A_ta"],
+        "g_ta_dis": g_ta_dis,
+        "g_ta_comp": g_ta_dis,
+        "g_ta_noise": 1.0 - q_ta,
+        "g_va_agr": q_va * s_vision * s_audio * agreements["A_va"],
+        "g_va_dis": g_va_dis,
+        "g_va_comp": g_va_dis,
+        "g_va_noise": 1.0 - q_va,
+    }
+
+
+def build_label_aware_relation_frame(
+    pred: dict[str, np.ndarray],
+    tau_agreement: float,
+    *,
+    disagreement_metric: str = "prob_jsd",
+    kernel_bandwidth: str | float = "median",
+    kernel_pair_mode: str = "text_anchor",
+    kernel_class_weight: float = 0.5,
+    kernel_max_class_samples: int = 1024,
+    seed: int = 0,
+) -> pd.DataFrame:
+    reliability = label_aware_reliability(
+        pred["prob_t"],
+        pred["prob_v"],
+        pred["prob_a"],
+        pred["y_true"],
+    )
+    if disagreement_metric == "prob_jsd":
+        distances = pairwise_disagreement(pred["prob_t"], pred["prob_v"], pred["prob_a"])
+    elif disagreement_metric == "kernel_mmd":
+        distances = kernel_pairwise_disagreement(
+            pred["h_t"],
+            pred["h_v"],
+            pred["h_a"],
+            pred["y_pred"],
+            bandwidth=kernel_bandwidth,
+            class_weight=kernel_class_weight,
+            max_class_samples=kernel_max_class_samples,
+            seed=seed,
+        )
+    else:
+        raise ValueError("disagreement_metric must be 'prob_jsd' or 'kernel_mmd'.")
+    gates = label_aware_relation_gates(
+        pred["prob_t"],
+        pred["prob_v"],
+        pred["prob_a"],
+        reliability,
+        tau_agreement,
+        distances=distances,
+    )
+    return pd.DataFrame(
+        {
+            "index": pred["index"],
+            "label_reg": pred["y_reg"],
+            "label_cls": pred["y_true"],
+            "prediction": pred["y_pred"],
+            **reliability,
+            **distances,
+            **gates,
+            "disagreement_metric": disagreement_metric,
+            "kernel_pair_mode": kernel_pair_mode,
+        }
+    )
+
+
+def summarize_relation_frame(frame: pd.DataFrame, split: str) -> dict[str, float | str]:
+    columns = [
+        "C_text",
+        "C_vision",
+        "C_audio",
+        "S_text",
+        "S_vision",
+        "S_audio",
+        "R_label_text",
+        "R_label_vision",
+        "R_label_audio",
+        "R_label_sample",
+        "A_tv",
+        "A_ta",
+        "A_va",
+        "B_tv_label",
+        "B_ta_label",
+        "B_va_label",
+        "g_tv_agr",
+        "g_tv_dis",
+        "g_tv_comp",
+        "g_tv_noise",
+        "g_ta_agr",
+        "g_ta_dis",
+        "g_ta_comp",
+        "g_ta_noise",
+        "g_va_agr",
+        "g_va_dis",
+        "g_va_comp",
+        "g_va_noise",
+    ]
+    payload: dict[str, float | str] = {"split": split, "n": float(len(frame))}
+    for column in columns:
+        payload[f"{column}_mean"] = float(frame[column].mean())
+        payload[f"{column}_std"] = float(frame[column].std(ddof=1))
+    return payload
 
 
 def validation_thresholds(valid_disagreement: np.ndarray) -> tuple[float, float]:

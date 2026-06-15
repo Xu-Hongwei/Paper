@@ -53,32 +53,27 @@ class ExperimentConfig:
     weight_decay: float = 1e-4
     hidden_dim: int = 128
     dropout: float = 0.2
-    eta_unimodal: float = 0.3
+    eta_unimodal: float = 0.1
     lambda_align_values: list[float] = field(
         default_factory=lambda: [0.001, 0.005, 0.01, 0.05, 0.1]
     )
     direct_add_alpha_values: list[float] = field(
         default_factory=lambda: [0.1, 0.3, 0.5, 1.0]
     )
+    pair_mode: str = "text_anchor"
+    align_pair_mode: str = "text_anchor"
+    direct_add_pair_mode: str = "text_anchor"
     run_infonce: bool = False
     lambda_nce_values: list[float] = field(default_factory=lambda: [0.01, 0.05, 0.1, 0.5])
     nce_temperature: float = 0.1
     nce_pair_mode: str = "text_anchor"
     disagreement_metric: str = "prob_jsd"
+    disagreement_pair_mode: str = "text_anchor"
     kernel_bandwidth: str = "median"
     kernel_pair_mode: str = "text_anchor"
     kernel_class_weight: float = 0.5
     kernel_max_class_samples: int = 1024
-    run_copa: bool = False
-    lambda_copa_values: list[float] = field(default_factory=lambda: [0.01, 0.05, 0.1])
     tau_agreement: float = 0.1
-    copa_proto_weight: float = 1.0
-    copa_agr_weight: float = 1.0
-    copa_comp_weight: float = 0.5
-    copa_comp_margin: float = 0.2
-    copa_orth_weight: float = 0.01
-    copa_gate_metric: str = "prob_jsd"
-    copa_kernel_bandwidth: str = "median"
     patience: int = 8
     num_workers: int = 0
     deterministic: bool = False

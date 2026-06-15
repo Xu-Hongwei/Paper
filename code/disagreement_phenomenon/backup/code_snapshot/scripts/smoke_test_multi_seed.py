@@ -83,12 +83,21 @@ def main() -> int:
             "--run_infonce",
             "--lambda_nce_values",
             "0.01",
-            "--pair_mode",
+            "--nce_pair_mode",
             "text_anchor",
             "--disagreement_metric",
             "kernel_mmd",
+            "--kernel_pair_mode",
+            "text_anchor",
             "--kernel_max_class_samples",
             "32",
+            "--run_copa",
+            "--lambda_copa_values",
+            "0.01",
+            "--copa_gate_type",
+            "label_support",
+            "--copa_orth_weight",
+            "0.01",
             "--patience",
             "1",
         ]
@@ -120,8 +129,16 @@ def main() -> int:
             "direct_add_relation_state_delta_summary.csv",
             "concat_aware_motivation_all.csv",
             "concat_aware_motivation_summary.csv",
+            "feature_consistency_diagnostic_all.csv",
+            "feature_consistency_diagnostic_summary.csv",
+            "residual_distribution_diagnostic_all.csv",
+            "residual_distribution_diagnostic_summary.csv",
             "residual_discriminative_probe_all.csv",
             "residual_discriminative_probe_summary.csv",
+            "selective_agreement_prototype_check_all.csv",
+            "selective_agreement_prototype_check_summary.csv",
+            "label_aware_relation_summary_all.csv",
+            "label_aware_relation_multi_seed_summary.csv",
             "lambda_test_delta_all.csv",
             "lambda_test_delta_summary.csv",
             "lambda_high_d_reliability_delta_all.csv",
@@ -136,6 +153,16 @@ def main() -> int:
             "infonce_lambda_test_delta_summary.csv",
             "infonce_lambda_high_d_reliability_delta_all.csv",
             "infonce_lambda_high_d_reliability_summary.csv",
+            "copa_delta_all.csv",
+            "copa_delta_summary.csv",
+            "copa_high_d_reliability_delta_all.csv",
+            "copa_high_d_reliability_summary.csv",
+            "copa_relation_state_delta_all.csv",
+            "copa_relation_state_delta_summary.csv",
+            "copa_lambda_test_delta_all.csv",
+            "copa_lambda_test_delta_summary.csv",
+            "copa_lambda_high_d_reliability_delta_all.csv",
+            "copa_lambda_high_d_reliability_summary.csv",
             "multi_seed_delta_macro_f1.png",
             "multi_seed_delta_macro_f1_detailed.png",
             "high_d_reliability_delta.png",
@@ -147,6 +174,10 @@ def main() -> int:
             "infonce_delta_macro_f1_detailed.png",
             "infonce_high_d_reliability_delta_detailed.png",
             "infonce_relation_state_delta_detailed.png",
+            "copa_lambda_delta_macro_f1_curve.png",
+            "copa_delta_macro_f1_detailed.png",
+            "copa_high_d_reliability_delta_detailed.png",
+            "copa_relation_state_delta_detailed.png",
             "relation_state_method_comparison_heatmap.png",
             "experiment_one_conclusion.json",
             "error_control_report.csv",
@@ -178,10 +209,6 @@ def main() -> int:
             "text_anchor_common_residual_macro_f1_mean",
             "text_anchor_residual_gain_macro_f1_mean",
             "text_anchor_shuffled_residual_macro_f1_mean",
-            "common_shuffled_residual_macro_f1_mean",
-            "residual_gain_vs_feature_shuffle_macro_f1_mean",
-            "text_anchor_common_shuffled_residual_macro_f1_mean",
-            "text_anchor_residual_gain_vs_feature_shuffle_macro_f1_mean",
         }
         missing_residual = sorted(residual_columns - set(residual_summary.columns))
         if missing_residual:
@@ -193,20 +220,6 @@ def main() -> int:
         infonce_summary = pd.read_csv(summary / "infonce_lambda_test_delta_summary.csv")
         if infonce_summary.empty or "lambda_nce" not in infonce_summary.columns:
             print("Multi-seed smoke test failed: InfoNCE summary is empty.", file=sys.stderr)
-            return 1
-        align_all = pd.read_csv(summary / "lambda_test_delta_all.csv")
-        if align_all.empty or set(align_all["align_pair_mode"]) != {"text_anchor"}:
-            print(
-                "Multi-seed smoke test failed: UncondAlign all-seed pair mode is wrong.",
-                file=sys.stderr,
-            )
-            return 1
-        direct_all = pd.read_csv(summary / "direct_add_alpha_test_delta_all.csv")
-        if direct_all.empty or set(direct_all["direct_add_pair_mode"]) != {"text_anchor"}:
-            print(
-                "Multi-seed smoke test failed: DirectAdd all-seed pair mode is wrong.",
-                file=sys.stderr,
-            )
             return 1
         print(f"Multi-seed smoke test passed. Outputs checked in {summary}")
         return 0

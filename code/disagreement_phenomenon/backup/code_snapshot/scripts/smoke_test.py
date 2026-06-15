@@ -81,12 +81,21 @@ def main() -> int:
             "--run_infonce",
             "--lambda_nce_values",
             "0.01",
-            "--pair_mode",
+            "--nce_pair_mode",
             "text_anchor",
             "--disagreement_metric",
             "kernel_mmd",
+            "--kernel_pair_mode",
+            "text_anchor",
             "--kernel_max_class_samples",
             "32",
+            "--run_copa",
+            "--lambda_copa_values",
+            "0.01",
+            "--copa_gate_type",
+            "label_support",
+            "--copa_orth_weight",
+            "0.01",
             "--patience",
             "2",
         ]
@@ -105,6 +114,14 @@ def main() -> int:
             "test_groups.csv",
             "group_metrics.csv",
             "delta_metrics.csv",
+            "train_label_aware_relations.csv",
+            "valid_label_aware_relations.csv",
+            "label_aware_relation_summary.csv",
+            "copa_delta_metrics.csv",
+            "copa_high_d_reliability_delta.csv",
+            "copa_lambda_sweep_valid.csv",
+            "copa_lambda_test_delta_metrics.csv",
+            "copa_lambda_high_d_reliability_delta.csv",
             "high_d_reliability_metrics.csv",
             "high_d_reliability_delta.csv",
             "relation_state_metrics.csv",
@@ -120,7 +137,10 @@ def main() -> int:
             "infonce_lambda_high_d_reliability_delta.csv",
             "infonce_relation_state_delta.csv",
             "concat_aware_motivation.csv",
+            "feature_consistency_diagnostic.csv",
+            "residual_distribution_diagnostic.csv",
             "residual_discriminative_probe.csv",
+            "selective_agreement_prototype_check.csv",
             "lambda_test_delta_metrics.csv",
             "lambda_high_d_reliability_delta.csv",
             "delta_macro_f1.png",
@@ -136,9 +156,6 @@ def main() -> int:
             "R_text",
             "R_vision",
             "R_audio",
-            "R_tv",
-            "R_ta",
-            "R_va",
             "R_sample",
             "D_tv",
             "D_ta",
@@ -152,9 +169,6 @@ def main() -> int:
             "high_d_reliability_group",
             "relation_state",
             "relation_state_desc",
-            "pair_mode",
-            "disagreement_pair_mode",
-            "kernel_pair_mode",
         }
         missing_columns = sorted(required_columns - set(groups.columns))
         if missing_columns:
@@ -171,33 +185,35 @@ def main() -> int:
         if not relation_states.intersection({"RA", "UA", "RD", "ND"}):
             print("Smoke test failed: relation-state split is empty.", file=sys.stderr)
             return 1
-        if set(groups["disagreement_pair_mode"]) != {"text_anchor"}:
+        label_aware = pd.read_csv(latest / "train_label_aware_relations.csv")
+        label_aware_columns = {
+            "C_text",
+            "S_text",
+            "R_label_text",
+            "R_label_sample",
+            "g_tv_agr",
+            "g_tv_comp",
+            "g_tv_noise",
+            "disagreement_metric",
+            "kernel_pair_mode",
+        }
+        missing_label_aware = sorted(label_aware_columns - set(label_aware.columns))
+        if missing_label_aware:
             print(
-                "Smoke test failed: disagreement_pair_mode was not recorded as text_anchor.",
+                f"Smoke test failed: missing label-aware columns {missing_label_aware}",
                 file=sys.stderr,
             )
             return 1
-        if set(groups["pair_mode"]) != {"text_anchor"}:
-            print("Smoke test failed: pair_mode was not recorded as text_anchor.", file=sys.stderr)
+        if set(label_aware["disagreement_metric"]) != {"kernel_mmd"}:
+            print(
+                "Smoke test failed: label-aware relation frame did not use kernel_mmd.",
+                file=sys.stderr,
+            )
             return 1
         infonce_sweep = pd.read_csv(latest / "infonce_lambda_sweep_valid.csv")
         if infonce_sweep.empty or set(infonce_sweep["nce_pair_mode"]) != {"text_anchor"}:
             print(
                 "Smoke test failed: InfoNCE text_anchor sweep is empty or has wrong pair mode.",
-                file=sys.stderr,
-            )
-            return 1
-        align_sweep = pd.read_csv(latest / "lambda_sweep_valid.csv")
-        if align_sweep.empty or set(align_sweep["align_pair_mode"]) != {"text_anchor"}:
-            print(
-                "Smoke test failed: UncondAlign sweep is empty or has wrong pair mode.",
-                file=sys.stderr,
-            )
-            return 1
-        direct_sweep = pd.read_csv(latest / "direct_add_alpha_sweep_valid.csv")
-        if direct_sweep.empty or set(direct_sweep["direct_add_pair_mode"]) != {"text_anchor"}:
-            print(
-                "Smoke test failed: DirectAdd sweep is empty or has wrong pair mode.",
                 file=sys.stderr,
             )
             return 1
@@ -207,10 +223,6 @@ def main() -> int:
             "text_anchor_common_residual_macro_f1",
             "text_anchor_residual_gain_macro_f1",
             "text_anchor_shuffled_residual_macro_f1",
-            "common_shuffled_residual_macro_f1",
-            "residual_gain_vs_feature_shuffle_macro_f1",
-            "text_anchor_common_shuffled_residual_macro_f1",
-            "text_anchor_residual_gain_vs_feature_shuffle_macro_f1",
         }
         missing_residual = sorted(residual_columns - set(residual_probe.columns))
         if missing_residual:
