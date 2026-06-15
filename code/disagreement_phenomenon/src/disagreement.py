@@ -8,6 +8,14 @@ from .metrics import classification_metrics
 
 GROUP_ORDER = ("Low-D", "Mid-D", "High-D")
 HIGH_D_RELIABILITY_GROUP_ORDER = ("High-D+Low-R", "High-D+High-R")
+RELATION_STATE_GROUP_ORDER = ("RA", "UA", "Mid-D", "RD", "ND")
+RELATION_STATE_DESCRIPTIONS = {
+    "RA": "Low-D+High-R",
+    "UA": "Low-D+Low-R",
+    "Mid-D": "Mid-D",
+    "RD": "High-D+High-R",
+    "ND": "High-D+Low-R",
+}
 
 
 def _kl_div(p: np.ndarray, q: np.ndarray, eps: float = 1e-8) -> np.ndarray:
@@ -28,10 +36,48 @@ def sample_disagreement(prob_t: np.ndarray, prob_v: np.ndarray, prob_a: np.ndarr
     return (d_tv + d_ta + d_va) / 3.0
 
 
+def pairwise_disagreement(
+    prob_t: np.ndarray,
+    prob_v: np.ndarray,
+    prob_a: np.ndarray,
+) -> dict[str, np.ndarray]:
+    return {
+        "D_tv": jsd(prob_t, prob_v),
+        "D_ta": jsd(prob_t, prob_a),
+        "D_va": jsd(prob_v, prob_a),
+    }
+
+
+def pairwise_agreement(
+    prob_t: np.ndarray,
+    prob_v: np.ndarray,
+    prob_a: np.ndarray,
+    tau_agreement: float,
+) -> dict[str, np.ndarray]:
+    if tau_agreement <= 0:
+        raise ValueError("tau_agreement must be positive.")
+    distances = pairwise_disagreement(prob_t, prob_v, prob_a)
+    return {
+        "A_tv": np.exp(-distances["D_tv"] / tau_agreement),
+        "A_ta": np.exp(-distances["D_ta"] / tau_agreement),
+        "A_va": np.exp(-distances["D_va"] / tau_agreement),
+    }
+
+
 def normalized_reliability(prob: np.ndarray, eps: float = 1e-8) -> np.ndarray:
     prob = np.clip(prob, eps, 1.0)
     entropy = -np.sum(prob * np.log(prob), axis=-1)
     return 1.0 - entropy / np.log(prob.shape[-1])
+
+
+def label_support(prob: np.ndarray, labels: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    prob = np.clip(prob, eps, 1.0)
+    labels = np.asarray(labels, dtype=np.int64).reshape(-1)
+    if prob.shape[0] != labels.shape[0]:
+        raise ValueError(
+            f"prob has {prob.shape[0]} samples but labels has {labels.shape[0]} samples."
+        )
+    return prob[np.arange(labels.shape[0]), labels]
 
 
 def sample_reliability(
@@ -51,9 +97,185 @@ def sample_reliability(
     }
 
 
+def label_aware_reliability(
+    prob_t: np.ndarray,
+    prob_v: np.ndarray,
+    prob_a: np.ndarray,
+    labels: np.ndarray,
+) -> dict[str, np.ndarray]:
+    c_text = normalized_reliability(prob_t)
+    c_vision = normalized_reliability(prob_v)
+    c_audio = normalized_reliability(prob_a)
+    s_text = label_support(prob_t, labels)
+    s_vision = label_support(prob_v, labels)
+    s_audio = label_support(prob_a, labels)
+    r_text = c_text * s_text
+    r_vision = c_vision * s_vision
+    r_audio = c_audio * s_audio
+    return {
+        "C_text": c_text,
+        "C_vision": c_vision,
+        "C_audio": c_audio,
+        "S_text": s_text,
+        "S_vision": s_vision,
+        "S_audio": s_audio,
+        "R_label_text": r_text,
+        "R_label_vision": r_vision,
+        "R_label_audio": r_audio,
+        "R_label_sample": (r_text + r_vision + r_audio) / 3.0,
+    }
+
+
+def relation_gates(
+    prob_t: np.ndarray,
+    prob_v: np.ndarray,
+    prob_a: np.ndarray,
+    reliability: dict[str, np.ndarray],
+    tau_agreement: float,
+    *,
+    prefix: str = "",
+) -> dict[str, np.ndarray]:
+    agreements = pairwise_agreement(prob_t, prob_v, prob_a, tau_agreement)
+    r_text = reliability[f"{prefix}text"]
+    r_vision = reliability[f"{prefix}vision"]
+    r_audio = reliability[f"{prefix}audio"]
+    products = {
+        "tv": r_text * r_vision,
+        "ta": r_text * r_audio,
+        "va": r_vision * r_audio,
+    }
+    return {
+        **agreements,
+        "g_tv_agr": products["tv"] * agreements["A_tv"],
+        "g_tv_comp": products["tv"] * (1.0 - agreements["A_tv"]),
+        "g_tv_noise": 1.0 - products["tv"],
+        "g_ta_agr": products["ta"] * agreements["A_ta"],
+        "g_ta_comp": products["ta"] * (1.0 - agreements["A_ta"]),
+        "g_ta_noise": 1.0 - products["ta"],
+        "g_va_agr": products["va"] * agreements["A_va"],
+        "g_va_comp": products["va"] * (1.0 - agreements["A_va"]),
+        "g_va_noise": 1.0 - products["va"],
+    }
+
+
+def label_aware_relation_gates(
+    prob_t: np.ndarray,
+    prob_v: np.ndarray,
+    prob_a: np.ndarray,
+    reliability: dict[str, np.ndarray],
+    tau_agreement: float,
+) -> dict[str, np.ndarray]:
+    agreements = pairwise_agreement(prob_t, prob_v, prob_a, tau_agreement)
+    c_text = reliability["C_text"]
+    c_vision = reliability["C_vision"]
+    c_audio = reliability["C_audio"]
+    s_text = reliability["S_text"]
+    s_vision = reliability["S_vision"]
+    s_audio = reliability["S_audio"]
+    q_tv = c_text * c_vision
+    q_ta = c_text * c_audio
+    q_va = c_vision * c_audio
+    b_tv = np.maximum(s_text, s_vision)
+    b_ta = np.maximum(s_text, s_audio)
+    b_va = np.maximum(s_vision, s_audio)
+    g_tv_dis = q_tv * b_tv * (1.0 - agreements["A_tv"])
+    g_ta_dis = q_ta * b_ta * (1.0 - agreements["A_ta"])
+    g_va_dis = q_va * b_va * (1.0 - agreements["A_va"])
+    return {
+        **agreements,
+        "B_tv_label": b_tv,
+        "B_ta_label": b_ta,
+        "B_va_label": b_va,
+        "g_tv_agr": q_tv * s_text * s_vision * agreements["A_tv"],
+        "g_tv_dis": g_tv_dis,
+        "g_tv_comp": g_tv_dis,
+        "g_tv_noise": 1.0 - q_tv,
+        "g_ta_agr": q_ta * s_text * s_audio * agreements["A_ta"],
+        "g_ta_dis": g_ta_dis,
+        "g_ta_comp": g_ta_dis,
+        "g_ta_noise": 1.0 - q_ta,
+        "g_va_agr": q_va * s_vision * s_audio * agreements["A_va"],
+        "g_va_dis": g_va_dis,
+        "g_va_comp": g_va_dis,
+        "g_va_noise": 1.0 - q_va,
+    }
+
+
+def build_label_aware_relation_frame(
+    pred: dict[str, np.ndarray],
+    tau_agreement: float,
+) -> pd.DataFrame:
+    reliability = label_aware_reliability(
+        pred["prob_t"],
+        pred["prob_v"],
+        pred["prob_a"],
+        pred["y_true"],
+    )
+    gates = label_aware_relation_gates(
+        pred["prob_t"],
+        pred["prob_v"],
+        pred["prob_a"],
+        reliability,
+        tau_agreement,
+    )
+    return pd.DataFrame(
+        {
+            "index": pred["index"],
+            "label_reg": pred["y_reg"],
+            "label_cls": pred["y_true"],
+            "prediction": pred["y_pred"],
+            **reliability,
+            **pairwise_disagreement(pred["prob_t"], pred["prob_v"], pred["prob_a"]),
+            **gates,
+        }
+    )
+
+
+def summarize_relation_frame(frame: pd.DataFrame, split: str) -> dict[str, float | str]:
+    columns = [
+        "C_text",
+        "C_vision",
+        "C_audio",
+        "S_text",
+        "S_vision",
+        "S_audio",
+        "R_label_text",
+        "R_label_vision",
+        "R_label_audio",
+        "R_label_sample",
+        "A_tv",
+        "A_ta",
+        "A_va",
+        "B_tv_label",
+        "B_ta_label",
+        "B_va_label",
+        "g_tv_agr",
+        "g_tv_dis",
+        "g_tv_comp",
+        "g_tv_noise",
+        "g_ta_agr",
+        "g_ta_dis",
+        "g_ta_comp",
+        "g_ta_noise",
+        "g_va_agr",
+        "g_va_dis",
+        "g_va_comp",
+        "g_va_noise",
+    ]
+    payload: dict[str, float | str] = {"split": split, "n": float(len(frame))}
+    for column in columns:
+        payload[f"{column}_mean"] = float(frame[column].mean())
+        payload[f"{column}_std"] = float(frame[column].std(ddof=1))
+    return payload
+
+
 def validation_thresholds(valid_disagreement: np.ndarray) -> tuple[float, float]:
     q33, q66 = np.quantile(valid_disagreement, [1.0 / 3.0, 2.0 / 3.0])
     return float(q33), float(q66)
+
+
+def reliability_threshold(valid_reliability: np.ndarray) -> float:
+    return float(np.quantile(valid_reliability, 0.5))
 
 
 def assign_groups(disagreement: np.ndarray, q33: float, q66: float) -> np.ndarray:
@@ -67,10 +289,19 @@ def assign_groups(disagreement: np.ndarray, q33: float, q66: float) -> np.ndarra
 def assign_high_d_reliability_groups(
     groups: np.ndarray,
     r_sample: np.ndarray,
+    r_threshold: float | None = None,
 ) -> np.ndarray:
     reliability_groups = np.full(groups.shape[0], "", dtype=object)
     high_indices = np.where(groups == "High-D")[0]
     if high_indices.shape[0] == 0:
+        return reliability_groups
+    if r_threshold is not None:
+        reliability_groups[
+            high_indices[r_sample[high_indices] < r_threshold]
+        ] = "High-D+Low-R"
+        reliability_groups[
+            high_indices[r_sample[high_indices] >= r_threshold]
+        ] = "High-D+High-R"
         return reliability_groups
     sorted_high = high_indices[np.argsort(r_sample[high_indices])]
     split = max(1, sorted_high.shape[0] // 2)
@@ -79,12 +310,30 @@ def assign_high_d_reliability_groups(
     return reliability_groups
 
 
+def assign_relation_state_groups(
+    groups: np.ndarray,
+    r_sample: np.ndarray,
+    r_threshold: float,
+) -> np.ndarray:
+    relation_states = np.full(groups.shape[0], "Mid-D", dtype=object)
+    low_d = groups == "Low-D"
+    high_d = groups == "High-D"
+    high_r = r_sample >= r_threshold
+    relation_states[low_d & high_r] = "RA"
+    relation_states[low_d & ~high_r] = "UA"
+    relation_states[high_d & high_r] = "RD"
+    relation_states[high_d & ~high_r] = "ND"
+    return relation_states
+
+
 def build_group_frame(
     test_pred: dict[str, np.ndarray],
     disagreement: np.ndarray,
     groups: np.ndarray,
     reliability: dict[str, np.ndarray] | None = None,
     reliability_groups: np.ndarray | None = None,
+    relation_state_groups: np.ndarray | None = None,
+    relations: dict[str, np.ndarray] | None = None,
 ) -> pd.DataFrame:
     payload = {
         "index": test_pred["index"],
@@ -96,8 +345,16 @@ def build_group_frame(
     }
     if reliability is not None:
         payload.update(reliability)
+    if relations is not None:
+        payload.update(relations)
     if reliability_groups is not None:
         payload["high_d_reliability_group"] = reliability_groups
+    if relation_state_groups is not None:
+        payload["relation_state"] = relation_state_groups
+        payload["relation_state_desc"] = [
+            RELATION_STATE_DESCRIPTIONS.get(str(group), str(group))
+            for group in relation_state_groups
+        ]
     return pd.DataFrame(payload)
 
 

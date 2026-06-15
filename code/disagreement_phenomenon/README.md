@@ -1,11 +1,42 @@
 # Disagreement Phenomenon Experiment
 
-This package implements the first CoPA motivation experiment:
+This package implements the first CoPA motivation experiment and a first
+label-aware CoPA prototype training baseline:
 
 > paired multimodal samples are not always alignment-positive.
 
-The first version compares a plain concat fusion model against an unconditional
-sample-level alignment model on Low/Mid/High disagreement groups.
+The default phenomenon experiment compares a plain concat fusion model against
+an unconditional sample-level alignment model on Low/Mid/High disagreement
+groups. It also exports the Experiment 1-v4 diagnostics for selective
+agreement and discriminative disagreement:
+
+```text
+prediction-level relation signal
+-> feature-level residual structure
+-> residual discriminative evidence
+```
+
+CoPA can be enabled explicitly with `--run_copa`.
+
+## Motivation Boundary
+
+Experiment 1 does not claim that Concat cannot learn labels. Concat learns
+label-level decision boundaries through the supervised objective:
+
+```text
+concat(h_text, h_vision, h_audio) -> y
+```
+
+The motivation question is narrower: Concat does not explicitly model relation
+states inside paired multimodal samples. It may learn a useful overall
+classifier while still hiding important subgroup differences such as reliable
+agreement, uncertain agreement, reliable disagreement, and noisy disagreement.
+
+In this experiment, "lossless" does not mean directly adding aligned features
+back to the original representation. It means preserving the original
+supervised fusion path for all samples, while applying relation-conditioned
+auxiliary constraints only to reliable agreement or reliable disagreement
+cases.
 
 ## Expected Data
 
@@ -38,16 +69,178 @@ shape `[N, T, D]`. Sequence arrays are mean-pooled inside the model.
 
 ## Run
 
+Single-seed phenomenon run:
+
 ```powershell
 python code/disagreement_phenomenon/scripts/run_phenomenon.py --dataset mosi --data_root E:\Xu\data\MultiBench
 python code/disagreement_phenomenon/scripts/run_phenomenon.py --dataset mosei --data_root E:\Xu\data\MultiBench
 ```
 
-For the MOSI multi-seed version of Experiment 1:
+Multi-seed phenomenon run:
 
 ```powershell
 python code/disagreement_phenomenon/scripts/run_multi_seed.py --dataset mosi --data_root E:\Xu\data\MultiBench --seeds 1 2 3 4 5
 ```
+
+For MOSEI on the current machine, the stable large-batch setting is:
+
+```powershell
+python -B code\disagreement_phenomenon\scripts\run_multi_seed.py --dataset mosei --data_root E:\Xu\data\MultiBench --seeds 1 2 3 4 5 6 7 8 9 10 --batch_size 1024 --num_workers 0 --epochs 25 --patience 6 --quiet
+```
+
+Avoid `--num_workers 2` on Windows for the large MOSEI arrays unless you have
+verified it locally. It can fail with PyTorch shared-event errors.
+
+## Methods
+
+### Concat
+
+The baseline uses three modality encoders and concatenates their hidden states:
+
+```text
+concat(h_text, h_vision, h_audio) -> classifier
+```
+
+### Unconditional Alignment
+
+The unconditional alignment baseline adds a pairwise cosine alignment loss:
+
+```text
+L = L_task + lambda_align * L_align
+```
+
+`lambda_align` is swept with:
+
+```text
+0.001, 0.005, 0.01, 0.05, 0.1
+```
+
+The best model is selected by validation overall Macro-F1. The script also
+exports the full lambda curve on test groups so the alignment strength effect
+can be inspected directly.
+
+### Direct Addition Alignment
+
+DirectAdd is a simple motivation baseline for the question:
+
+```text
+If direct addition preserves original information, is relation-conditioned
+soft splitting still needed?
+```
+
+It keeps the original supervised fusion path but directly adds a sample-level
+aligned summary back to each modality before fusion:
+
+```text
+h_align = mean(h_text, h_vision, h_audio)
+h_m_add = h_m + alpha * h_align
+```
+
+`alpha` is swept with:
+
+```text
+0.1, 0.3, 0.5, 1.0
+```
+
+DirectAdd is intentionally not relation-aware. If it is unstable on RD
+(`High-D+High-R`) or sensitive to `alpha`, that supports the claim that direct
+addition is not enough; relation-conditioned soft decomposition is needed.
+DirectAdd is a motivation baseline, not a CoPA component.
+
+### Experiment 1-v4 diagnostics
+
+Motivation grouping uses validation thresholds only. The validation set defines
+Low/Mid/High-D by the 1/3 and 2/3 quantiles of prediction-distribution
+disagreement, and defines High/Low-R by the median entropy reliability. The
+test set only applies these thresholds.
+
+The exported relation states are:
+
+```text
+RA = Low-D + High-R   reliable agreement
+UA = Low-D + Low-R    uncertain agreement
+RD = High-D + High-R  reliable disagreement
+ND = High-D + Low-R   noisy disagreement
+```
+
+The v4 diagnostics include feature-level disagreement, residual distribution
+diagnostics, residual-only/common-only/common+residual probes, shuffled
+residual-label negative control, and a selective agreement prototype check.
+
+`concat_aware_motivation.csv` combines the key diagnostic columns:
+
+```text
+Group | Concat F1 | UncondAlign F1 | DirectAdd F1 | SoftSplit Probe F1
+```
+
+This table is for motivation only. It tests whether relation states provide
+meaningful diagnostic signals beyond ordinary concatenation, fixed-strength
+alignment, and direct feature addition.
+
+### CoPA Prototype Baseline
+
+Enable it with:
+
+```powershell
+python -B code\disagreement_phenomenon\scripts\run_phenomenon.py --dataset mosi --data_root E:\Xu\data\MultiBench --run_copa
+```
+
+or multi-seed:
+
+```powershell
+python -B code\disagreement_phenomenon\scripts\run_multi_seed.py --dataset mosei --data_root E:\Xu\data\MultiBench --seeds 1 2 3 4 5 6 7 8 9 10 --batch_size 1024 --num_workers 0 --epochs 25 --patience 6 --quiet --run_copa
+```
+
+CoPA uses label-aware reliability during supervised training:
+
+```text
+C_m = 1 - H(p_m) / log(K)
+S_m = p_m(y)
+R_label_m = C_m * S_m
+```
+
+Then pairwise agreement is:
+
+```text
+A_ij = exp(-JSD(p_i, p_j) / tau_agreement)
+```
+
+and the relation gates are:
+
+```text
+g_ij_agr   = C_i C_j S_i S_j A_ij
+B_ij       = max(S_i, S_j)
+g_ij_dis   = C_i C_j B_ij (1 - A_ij)
+g_ij_noise = 1 - C_i C_j
+```
+
+The exported `g_ij_comp` columns are kept as backward-compatible aliases for
+`g_ij_dis`. This gate allows a reliable contrastive modality to contribute to
+disagreement learning when at least one modality strongly supports the label.
+
+The current CoPA loss combines:
+
+```text
+prototype alignment: reliable modality -> true-label prototype
+agreement alignment: reliable agreeing modality pairs -> pull together
+competition margin: reliable disagreeing modality pairs -> avoid over-alignment
+```
+
+The CoPA sweep uses:
+
+```text
+lambda_copa = 0.01, 0.05, 0.1
+```
+
+Important distinction:
+
+```text
+Motivation grouping on validation/test does not use labels.
+CoPA supervised prototype training uses train labels through p_m(y).
+```
+
+This avoids test-label leakage while still preventing confidently wrong training
+modalities from contaminating prototypes.
 
 ## Prepare Data
 
@@ -141,8 +334,83 @@ Outputs are written to:
 code/disagreement_phenomenon/outputs/<dataset>/<timestamp>/
 ```
 
+Key single-run outputs:
+
+```text
+test_groups.csv
+group_metrics.csv
+delta_metrics.csv
+lambda_test_delta_metrics.csv
+lambda_delta_macro_f1_curve.png
+train_label_aware_relations.csv
+valid_label_aware_relations.csv
+label_aware_relation_summary.csv
+relation_state_metrics.csv
+relation_state_delta.csv
+direct_add_alpha_sweep_valid.csv
+direct_add_alpha_test_delta_metrics.csv
+direct_add_delta_metrics.csv
+direct_add_relation_state_delta.csv
+concat_aware_motivation.csv
+direct_add_model.pt
+feature_consistency_diagnostic.csv
+residual_distribution_diagnostic.csv
+residual_discriminative_probe.csv
+selective_agreement_prototype_check.csv
+```
+
+Additional CoPA outputs when `--run_copa` is used:
+
+```text
+copa_delta_metrics.csv
+copa_lambda_sweep_valid.csv
+copa_lambda_test_delta_metrics.csv
+copa_high_d_reliability_delta.csv
+copa_relation_state_delta.csv
+copa_model.pt
+```
+
+Key multi-seed outputs:
+
+```text
+multi_seed_delta_summary.csv
+lambda_test_delta_summary.csv
+lambda_delta_macro_f1_curve.png
+label_aware_relation_multi_seed_summary.csv
+relation_state_delta_summary.csv
+relation_state_metrics_summary.csv
+direct_add_delta_summary.csv
+direct_add_alpha_test_delta_summary.csv
+direct_add_relation_state_delta_summary.csv
+concat_aware_motivation_summary.csv
+feature_consistency_diagnostic_summary.csv
+residual_distribution_diagnostic_summary.csv
+residual_discriminative_probe_summary.csv
+selective_agreement_prototype_check_summary.csv
+```
+
+The multi-seed summary directory also keeps the corresponding per-seed merged
+tables with `_all.csv` suffixes, including:
+
+```text
+direct_add_delta_all.csv
+direct_add_alpha_test_delta_all.csv
+direct_add_relation_state_delta_all.csv
+concat_aware_motivation_all.csv
+```
+
+Additional multi-seed CoPA outputs when `--run_copa` is used:
+
+```text
+copa_delta_summary.csv
+copa_lambda_test_delta_summary.csv
+copa_lambda_delta_macro_f1_curve.png
+copa_relation_state_delta_summary.csv
+```
+
 ## Smoke Test
 
 ```powershell
 python code/disagreement_phenomenon/scripts/smoke_test.py
+python code/disagreement_phenomenon/scripts/smoke_test_multi_seed.py
 ```

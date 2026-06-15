@@ -1,8 +1,0 @@
-{
-  "high_d_delta_macro_f1_mean": -0.0005654827950197803,
-  "low_d_delta_macro_f1_mean": 0.01294152293314208,
-  "mid_d_delta_macro_f1_mean": 0.0032725521243936197,
-  "high_d_is_negative": true,
-  "high_d_more_harmful_than_low_d": true,
-  "high_d_more_harmful_than_mid_d": true
-}

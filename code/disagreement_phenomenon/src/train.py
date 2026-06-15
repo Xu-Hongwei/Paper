@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from .metrics import classification_metrics
-from .model import MultimodalClassifier, unconditional_alignment_loss
+from .model import MultimodalClassifier, label_aware_copa_loss, unconditional_alignment_loss
 
 
 def move_batch(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
@@ -22,6 +22,12 @@ def compute_loss(
     labels: torch.Tensor,
     eta_unimodal: float = 0.0,
     lambda_align: float = 0.0,
+    lambda_copa: float = 0.0,
+    tau_agreement: float = 0.1,
+    copa_proto_weight: float = 1.0,
+    copa_agr_weight: float = 1.0,
+    copa_comp_weight: float = 0.5,
+    copa_comp_margin: float = 0.2,
 ) -> torch.Tensor:
     loss = F.cross_entropy(outputs["logits_f"], labels)
     if eta_unimodal > 0:
@@ -32,6 +38,17 @@ def compute_loss(
         )
     if lambda_align > 0:
         loss = loss + lambda_align * unconditional_alignment_loss(outputs)
+    if lambda_copa > 0:
+        copa_loss, _ = label_aware_copa_loss(
+            outputs,
+            labels,
+            tau_agreement=tau_agreement,
+            proto_weight=copa_proto_weight,
+            agr_weight=copa_agr_weight,
+            comp_weight=copa_comp_weight,
+            comp_margin=copa_comp_margin,
+        )
+        loss = loss + lambda_copa * copa_loss
     return loss
 
 
@@ -50,6 +67,9 @@ def predict(
     probs_v: list[np.ndarray] = []
     probs_a: list[np.ndarray] = []
     probs_f: list[np.ndarray] = []
+    feats_t: list[np.ndarray] = []
+    feats_v: list[np.ndarray] = []
+    feats_a: list[np.ndarray] = []
 
     for batch in loader:
         batch = move_batch(batch, device)
@@ -63,6 +83,9 @@ def predict(
         probs_v.append(torch.softmax(outputs["logits_v"], dim=-1).detach().cpu().numpy())
         probs_a.append(torch.softmax(outputs["logits_a"], dim=-1).detach().cpu().numpy())
         probs_f.append(pf.detach().cpu().numpy())
+        feats_t.append(outputs["h_t"].detach().cpu().numpy())
+        feats_v.append(outputs["h_v"].detach().cpu().numpy())
+        feats_a.append(outputs["h_a"].detach().cpu().numpy())
 
     return {
         "y_true": np.concatenate(y_true),
@@ -73,6 +96,9 @@ def predict(
         "prob_v": np.concatenate(probs_v),
         "prob_a": np.concatenate(probs_a),
         "prob_f": np.concatenate(probs_f),
+        "h_t": np.concatenate(feats_t),
+        "h_v": np.concatenate(feats_v),
+        "h_a": np.concatenate(feats_a),
     }
 
 
@@ -96,6 +122,12 @@ def train_model(
     weight_decay: float,
     eta_unimodal: float = 0.0,
     lambda_align: float = 0.0,
+    lambda_copa: float = 0.0,
+    tau_agreement: float = 0.1,
+    copa_proto_weight: float = 1.0,
+    copa_agr_weight: float = 1.0,
+    copa_comp_weight: float = 0.5,
+    copa_comp_margin: float = 0.2,
     patience: int = 8,
     desc: str = "train",
     show_progress: bool = True,
@@ -123,6 +155,12 @@ def train_model(
                 labels,
                 eta_unimodal=eta_unimodal,
                 lambda_align=lambda_align,
+                lambda_copa=lambda_copa,
+                tau_agreement=tau_agreement,
+                copa_proto_weight=copa_proto_weight,
+                copa_agr_weight=copa_agr_weight,
+                copa_comp_weight=copa_comp_weight,
+                copa_comp_margin=copa_comp_margin,
             )
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)

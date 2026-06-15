@@ -59,6 +59,7 @@ def main() -> int:
 
         command = [
             sys.executable,
+            "-B",
             str(RUNNER),
             "--dataset",
             "mosi",
@@ -75,6 +76,11 @@ def main() -> int:
             "--lambda_align_values",
             "0.01",
             "0.05",
+            "--direct_add_alpha_values",
+            "0.1",
+            "--run_copa",
+            "--lambda_copa_values",
+            "0.01",
             "--patience",
             "2",
         ]
@@ -93,8 +99,27 @@ def main() -> int:
             "test_groups.csv",
             "group_metrics.csv",
             "delta_metrics.csv",
+            "train_label_aware_relations.csv",
+            "valid_label_aware_relations.csv",
+            "label_aware_relation_summary.csv",
+            "copa_delta_metrics.csv",
+            "copa_high_d_reliability_delta.csv",
+            "copa_lambda_sweep_valid.csv",
+            "copa_lambda_test_delta_metrics.csv",
+            "copa_lambda_high_d_reliability_delta.csv",
             "high_d_reliability_metrics.csv",
             "high_d_reliability_delta.csv",
+            "relation_state_metrics.csv",
+            "relation_state_delta.csv",
+            "direct_add_alpha_sweep_valid.csv",
+            "direct_add_alpha_test_delta_metrics.csv",
+            "direct_add_delta_metrics.csv",
+            "direct_add_relation_state_delta.csv",
+            "concat_aware_motivation.csv",
+            "feature_consistency_diagnostic.csv",
+            "residual_distribution_diagnostic.csv",
+            "residual_discriminative_probe.csv",
+            "selective_agreement_prototype_check.csv",
             "lambda_test_delta_metrics.csv",
             "lambda_high_d_reliability_delta.csv",
             "delta_macro_f1.png",
@@ -111,7 +136,18 @@ def main() -> int:
             "R_vision",
             "R_audio",
             "R_sample",
+            "D_tv",
+            "D_ta",
+            "D_va",
+            "A_tv",
+            "A_ta",
+            "A_va",
+            "g_tv_agr",
+            "g_tv_comp",
+            "g_tv_noise",
             "high_d_reliability_group",
+            "relation_state",
+            "relation_state_desc",
         }
         missing_columns = sorted(required_columns - set(groups.columns))
         if missing_columns:
@@ -123,6 +159,27 @@ def main() -> int:
         high_d_groups = set(groups.loc[groups["group"] == "High-D", "high_d_reliability_group"])
         if not high_d_groups.intersection({"High-D+Low-R", "High-D+High-R"}):
             print("Smoke test failed: High-D reliability split is empty.", file=sys.stderr)
+            return 1
+        relation_states = set(groups["relation_state"])
+        if not relation_states.intersection({"RA", "UA", "RD", "ND"}):
+            print("Smoke test failed: relation-state split is empty.", file=sys.stderr)
+            return 1
+        label_aware = pd.read_csv(latest / "train_label_aware_relations.csv")
+        label_aware_columns = {
+            "C_text",
+            "S_text",
+            "R_label_text",
+            "R_label_sample",
+            "g_tv_agr",
+            "g_tv_comp",
+            "g_tv_noise",
+        }
+        missing_label_aware = sorted(label_aware_columns - set(label_aware.columns))
+        if missing_label_aware:
+            print(
+                f"Smoke test failed: missing label-aware columns {missing_label_aware}",
+                file=sys.stderr,
+            )
             return 1
         print(f"Smoke test passed. Outputs checked in {latest}")
         return 0

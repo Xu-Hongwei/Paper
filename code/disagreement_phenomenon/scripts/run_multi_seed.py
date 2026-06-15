@@ -43,8 +43,30 @@ def parse_args() -> argparse.Namespace:
         "--lambda_align_values",
         type=float,
         nargs="+",
-        default=[0.01, 0.05, 0.1, 0.5],
+        default=[0.001, 0.005, 0.01, 0.05, 0.1],
     )
+    parser.add_argument(
+        "--direct_add_alpha_values",
+        type=float,
+        nargs="+",
+        default=[0.1, 0.3, 0.5, 1.0],
+    )
+    parser.add_argument(
+        "--run_copa",
+        action="store_true",
+        help="Train and aggregate the label-aware CoPA prototype model.",
+    )
+    parser.add_argument(
+        "--lambda_copa_values",
+        type=float,
+        nargs="+",
+        default=[0.01, 0.05, 0.1],
+    )
+    parser.add_argument("--tau_agreement", type=float, default=0.1)
+    parser.add_argument("--copa_proto_weight", type=float, default=1.0)
+    parser.add_argument("--copa_agr_weight", type=float, default=1.0)
+    parser.add_argument("--copa_comp_weight", type=float, default=0.5)
+    parser.add_argument("--copa_comp_margin", type=float, default=0.2)
     parser.add_argument("--patience", type=int, default=8)
     parser.add_argument(
         "--quiet",
@@ -135,9 +157,29 @@ def run_one_seed(args: argparse.Namespace, run_root: Path, seed: int, seen: set[
         str(args.eta_unimodal),
         "--patience",
         str(args.patience),
+        "--tau_agreement",
+        str(args.tau_agreement),
         "--lambda_align_values",
         *[str(value) for value in args.lambda_align_values],
+        "--direct_add_alpha_values",
+        *[str(value) for value in args.direct_add_alpha_values],
     ]
+    if args.run_copa:
+        command.extend(
+            [
+                "--run_copa",
+                "--lambda_copa_values",
+                *[str(value) for value in args.lambda_copa_values],
+                "--copa_proto_weight",
+                str(args.copa_proto_weight),
+                "--copa_agr_weight",
+                str(args.copa_agr_weight),
+                "--copa_comp_weight",
+                str(args.copa_comp_weight),
+                "--copa_comp_margin",
+                str(args.copa_comp_margin),
+            ]
+        )
     if args.quiet:
         command.append("--quiet")
     print(f"\n=== Running seed {seed} ===")
@@ -172,6 +214,14 @@ def main() -> int:
             "dropout": args.dropout,
             "eta_unimodal": args.eta_unimodal,
             "lambda_align_values": args.lambda_align_values,
+            "direct_add_alpha_values": args.direct_add_alpha_values,
+            "run_copa": args.run_copa,
+            "lambda_copa_values": args.lambda_copa_values,
+            "tau_agreement": args.tau_agreement,
+            "copa_proto_weight": args.copa_proto_weight,
+            "copa_agr_weight": args.copa_agr_weight,
+            "copa_comp_weight": args.copa_comp_weight,
+            "copa_comp_margin": args.copa_comp_margin,
             "patience": args.patience,
             "quiet": args.quiet,
         },
@@ -184,17 +234,70 @@ def main() -> int:
 
     delta_all = read_seed_csv(run_dirs, "delta_metrics.csv")
     group_all = read_seed_csv(run_dirs, "group_metrics.csv")
+    direct_add_delta_all = read_seed_csv(run_dirs, "direct_add_delta_metrics.csv")
+    direct_add_alpha_delta_all = read_seed_csv(
+        run_dirs,
+        "direct_add_alpha_test_delta_metrics.csv",
+    )
     reliability_delta_all = read_seed_csv(run_dirs, "high_d_reliability_delta.csv")
     reliability_metrics_all = read_seed_csv(run_dirs, "high_d_reliability_metrics.csv")
+    relation_state_delta_all = read_seed_csv(run_dirs, "relation_state_delta.csv")
+    relation_state_metrics_all = read_seed_csv(run_dirs, "relation_state_metrics.csv")
+    direct_add_relation_state_delta_all = read_seed_csv(
+        run_dirs,
+        "direct_add_relation_state_delta.csv",
+    )
+    concat_aware_all = read_seed_csv(run_dirs, "concat_aware_motivation.csv")
+    feature_consistency_all = read_seed_csv(run_dirs, "feature_consistency_diagnostic.csv")
+    residual_diagnostic_all = read_seed_csv(run_dirs, "residual_distribution_diagnostic.csv")
+    residual_probe_all = read_seed_csv(run_dirs, "residual_discriminative_probe.csv")
+    selective_prototype_all = read_seed_csv(
+        run_dirs,
+        "selective_agreement_prototype_check.csv",
+    )
+    label_aware_relation_all = read_seed_csv(run_dirs, "label_aware_relation_summary.csv")
     lambda_delta_all = read_seed_csv(run_dirs, "lambda_test_delta_metrics.csv")
     lambda_reliability_delta_all = read_seed_csv(
         run_dirs,
         "lambda_high_d_reliability_delta.csv",
     )
+    copa_delta_all = pd.DataFrame()
+    copa_reliability_delta_all = pd.DataFrame()
+    copa_relation_state_delta_all = pd.DataFrame()
+    copa_lambda_delta_all = pd.DataFrame()
+    copa_lambda_reliability_delta_all = pd.DataFrame()
+    if args.run_copa:
+        copa_delta_all = read_seed_csv(run_dirs, "copa_delta_metrics.csv")
+        copa_reliability_delta_all = read_seed_csv(
+            run_dirs,
+            "copa_high_d_reliability_delta.csv",
+        )
+        copa_relation_state_delta_all = read_seed_csv(
+            run_dirs,
+            "copa_relation_state_delta.csv",
+        )
+        copa_lambda_delta_all = read_seed_csv(
+            run_dirs,
+            "copa_lambda_test_delta_metrics.csv",
+        )
+        copa_lambda_reliability_delta_all = read_seed_csv(
+            run_dirs,
+            "copa_lambda_high_d_reliability_delta.csv",
+        )
 
     delta_all.to_csv(summary_dir / "multi_seed_delta_all.csv", index=False, encoding="utf-8-sig")
     group_all.to_csv(
         summary_dir / "multi_seed_group_metrics_all.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    direct_add_delta_all.to_csv(
+        summary_dir / "direct_add_delta_all.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    direct_add_alpha_delta_all.to_csv(
+        summary_dir / "direct_add_alpha_test_delta_all.csv",
         index=False,
         encoding="utf-8-sig",
     )
@@ -208,6 +311,51 @@ def main() -> int:
         index=False,
         encoding="utf-8-sig",
     )
+    relation_state_delta_all.to_csv(
+        summary_dir / "relation_state_delta_all.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    relation_state_metrics_all.to_csv(
+        summary_dir / "relation_state_metrics_all.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    direct_add_relation_state_delta_all.to_csv(
+        summary_dir / "direct_add_relation_state_delta_all.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    concat_aware_all.to_csv(
+        summary_dir / "concat_aware_motivation_all.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    feature_consistency_all.to_csv(
+        summary_dir / "feature_consistency_diagnostic_all.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    residual_diagnostic_all.to_csv(
+        summary_dir / "residual_distribution_diagnostic_all.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    residual_probe_all.to_csv(
+        summary_dir / "residual_discriminative_probe_all.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    selective_prototype_all.to_csv(
+        summary_dir / "selective_agreement_prototype_check_all.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    label_aware_relation_all.to_csv(
+        summary_dir / "label_aware_relation_summary_all.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
     lambda_delta_all.to_csv(
         summary_dir / "lambda_test_delta_all.csv",
         index=False,
@@ -218,6 +366,32 @@ def main() -> int:
         index=False,
         encoding="utf-8-sig",
     )
+    if args.run_copa:
+        copa_delta_all.to_csv(
+            summary_dir / "copa_delta_all.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        copa_reliability_delta_all.to_csv(
+            summary_dir / "copa_high_d_reliability_delta_all.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        copa_relation_state_delta_all.to_csv(
+            summary_dir / "copa_relation_state_delta_all.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        copa_lambda_delta_all.to_csv(
+            summary_dir / "copa_lambda_test_delta_all.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        copa_lambda_reliability_delta_all.to_csv(
+            summary_dir / "copa_lambda_high_d_reliability_delta_all.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
 
     delta_summary = flatten_summary(
         delta_all,
@@ -229,10 +403,83 @@ def main() -> int:
         ["method", "group"],
         ["acc", "macro_f1", "n"],
     )
+    direct_add_delta_summary = flatten_summary(
+        direct_add_delta_all,
+        ["group"],
+        ["delta_acc", "delta_macro_f1", "direct_add_alpha"],
+    )
+    direct_add_alpha_delta_summary = flatten_summary(
+        direct_add_alpha_delta_all,
+        ["direct_add_alpha", "group"],
+        ["delta_acc", "delta_macro_f1", "valid_macro_f1", "valid_acc"],
+    )
     reliability_summary = flatten_summary(
         reliability_delta_all,
         ["group"],
         ["delta_acc", "delta_macro_f1", "lambda_align"],
+    )
+    relation_state_summary = flatten_summary(
+        relation_state_delta_all,
+        ["group"],
+        ["delta_acc", "delta_macro_f1", "lambda_align"],
+    )
+    relation_state_metrics_summary = flatten_summary(
+        relation_state_metrics_all,
+        ["method", "group"],
+        ["acc", "macro_f1", "n"],
+    )
+    direct_add_relation_state_summary = flatten_summary(
+        direct_add_relation_state_delta_all,
+        ["group"],
+        ["delta_acc", "delta_macro_f1", "direct_add_alpha"],
+    )
+    concat_aware_summary = flatten_summary(
+        concat_aware_all,
+        ["group"],
+        [
+            "concat_macro_f1",
+            "uncond_align_macro_f1",
+            "direct_add_macro_f1",
+            "soft_split_probe_macro_f1",
+            "residual_gain_macro_f1",
+            "shuffled_residual_only_macro_f1",
+            "lambda_align",
+            "direct_add_alpha",
+        ],
+    )
+    feature_consistency_summary = flatten_summary(
+        feature_consistency_all,
+        ["group"],
+        ["n", "avg_Dpred", "avg_Dfeat", "spearman_Dpred_Dfeat"],
+    )
+    residual_diagnostic_summary = flatten_summary(
+        residual_diagnostic_all,
+        ["group"],
+        ["n", "avg_Dpred", "avg_Dfeat", "residual_dist", "residual_sep"],
+    )
+    residual_probe_summary = flatten_summary(
+        residual_probe_all,
+        ["group"],
+        [
+            "train_n",
+            "test_n",
+            "common_only_macro_f1",
+            "residual_only_macro_f1",
+            "common_residual_macro_f1",
+            "residual_gain_macro_f1",
+            "shuffled_residual_only_macro_f1",
+        ],
+    )
+    selective_prototype_summary = flatten_summary(
+        selective_prototype_all,
+        ["prototype", "eval_group"],
+        [
+            "train_n",
+            "prototype_purity",
+            "intra_class_compactness",
+            "nearest_proto_acc",
+            "nearest_proto_macro_f1",
+        ],
     )
     lambda_delta_summary = flatten_summary(
         lambda_delta_all,
@@ -244,6 +491,47 @@ def main() -> int:
         ["lambda_align", "group"],
         ["delta_acc", "delta_macro_f1", "valid_macro_f1", "valid_acc"],
     )
+    relation_value_cols = [
+        column
+        for column in label_aware_relation_all.columns
+        if column not in {"seed", "run_dir", "split"}
+    ]
+    label_aware_relation_summary = flatten_summary(
+        label_aware_relation_all,
+        ["split"],
+        relation_value_cols,
+    )
+    copa_delta_summary = pd.DataFrame()
+    copa_reliability_summary = pd.DataFrame()
+    copa_relation_state_summary = pd.DataFrame()
+    copa_lambda_delta_summary = pd.DataFrame()
+    copa_lambda_reliability_summary = pd.DataFrame()
+    if args.run_copa:
+        copa_delta_summary = flatten_summary(
+            copa_delta_all,
+            ["group"],
+            ["delta_acc", "delta_macro_f1", "lambda_copa"],
+        )
+        copa_reliability_summary = flatten_summary(
+            copa_reliability_delta_all,
+            ["group"],
+            ["delta_acc", "delta_macro_f1", "lambda_copa"],
+        )
+        copa_relation_state_summary = flatten_summary(
+            copa_relation_state_delta_all,
+            ["group"],
+            ["delta_acc", "delta_macro_f1", "lambda_copa"],
+        )
+        copa_lambda_delta_summary = flatten_summary(
+            copa_lambda_delta_all,
+            ["lambda_copa", "group"],
+            ["delta_acc", "delta_macro_f1", "valid_macro_f1", "valid_acc"],
+        )
+        copa_lambda_reliability_summary = flatten_summary(
+            copa_lambda_reliability_delta_all,
+            ["lambda_copa", "group"],
+            ["delta_acc", "delta_macro_f1", "valid_macro_f1", "valid_acc"],
+        )
 
     delta_summary.to_csv(
         summary_dir / "multi_seed_delta_summary.csv",
@@ -255,8 +543,58 @@ def main() -> int:
         index=False,
         encoding="utf-8-sig",
     )
+    direct_add_delta_summary.to_csv(
+        summary_dir / "direct_add_delta_summary.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    direct_add_alpha_delta_summary.to_csv(
+        summary_dir / "direct_add_alpha_test_delta_summary.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
     reliability_summary.to_csv(
         summary_dir / "high_d_reliability_summary.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    relation_state_summary.to_csv(
+        summary_dir / "relation_state_delta_summary.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    relation_state_metrics_summary.to_csv(
+        summary_dir / "relation_state_metrics_summary.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    direct_add_relation_state_summary.to_csv(
+        summary_dir / "direct_add_relation_state_delta_summary.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    concat_aware_summary.to_csv(
+        summary_dir / "concat_aware_motivation_summary.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    feature_consistency_summary.to_csv(
+        summary_dir / "feature_consistency_diagnostic_summary.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    residual_diagnostic_summary.to_csv(
+        summary_dir / "residual_distribution_diagnostic_summary.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    residual_probe_summary.to_csv(
+        summary_dir / "residual_discriminative_probe_summary.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    selective_prototype_summary.to_csv(
+        summary_dir / "selective_agreement_prototype_check_summary.csv",
         index=False,
         encoding="utf-8-sig",
     )
@@ -270,6 +608,37 @@ def main() -> int:
         index=False,
         encoding="utf-8-sig",
     )
+    label_aware_relation_summary.to_csv(
+        summary_dir / "label_aware_relation_multi_seed_summary.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    if args.run_copa:
+        copa_delta_summary.to_csv(
+            summary_dir / "copa_delta_summary.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        copa_reliability_summary.to_csv(
+            summary_dir / "copa_high_d_reliability_summary.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        copa_relation_state_summary.to_csv(
+            summary_dir / "copa_relation_state_delta_summary.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        copa_lambda_delta_summary.to_csv(
+            summary_dir / "copa_lambda_test_delta_summary.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        copa_lambda_reliability_summary.to_csv(
+            summary_dir / "copa_lambda_high_d_reliability_summary.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
 
     save_multi_seed_delta_plot(delta_summary, summary_dir / "multi_seed_delta_macro_f1.png")
     save_reliability_delta_plot(
@@ -281,14 +650,36 @@ def main() -> int:
         summary_dir / "lambda_delta_macro_f1_curve.png",
         title="Multi-seed lambda alignment strength curve",
     )
+    if args.run_copa:
+        copa_curve_df = copa_lambda_delta_summary.rename(
+            columns={"lambda_copa": "lambda_align"}
+        )
+        save_lambda_curve_plot(
+            copa_curve_df,
+            summary_dir / "copa_lambda_delta_macro_f1_curve.png",
+            title="Multi-seed CoPA strength curve",
+        )
     write_conclusion(delta_summary, summary_dir / "experiment_one_conclusion.json")
 
     print("\nMulti-seed delta summary:")
     print(delta_summary.to_string(index=False))
     print("\nHigh-D reliability summary:")
     print(reliability_summary.to_string(index=False))
+    print("\nRelation-state summary:")
+    print(relation_state_summary.to_string(index=False))
+    print("\nDirectAdd relation-state summary:")
+    print(direct_add_relation_state_summary.to_string(index=False))
+    print("\nConcat-aware motivation summary:")
+    print(concat_aware_summary.to_string(index=False))
+    print("\nResidual probe summary:")
+    print(residual_probe_summary.to_string(index=False))
     print("\nLambda strength delta summary:")
     print(lambda_delta_summary.to_string(index=False))
+    if args.run_copa:
+        print("\nCoPA delta summary:")
+        print(copa_delta_summary.to_string(index=False))
+        print("\nCoPA lambda strength delta summary:")
+        print(copa_lambda_delta_summary.to_string(index=False))
     print(f"\nSaved multi-seed summary to: {summary_dir}")
     return 0
 
