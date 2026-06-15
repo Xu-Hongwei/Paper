@@ -56,6 +56,36 @@ def parse_args() -> argparse.Namespace:
         default=[0.1, 0.3, 0.5, 1.0],
     )
     parser.add_argument(
+        "--run_infonce",
+        action="store_true",
+        help="Train and aggregate unconditional InfoNCE baselines.",
+    )
+    parser.add_argument(
+        "--lambda_nce_values",
+        type=float,
+        nargs="+",
+        default=[0.01, 0.05, 0.1, 0.5],
+    )
+    parser.add_argument("--nce_temperature", type=float, default=0.1)
+    parser.add_argument(
+        "--nce_pair_mode",
+        choices=("text_anchor", "full_pair"),
+        default="text_anchor",
+    )
+    parser.add_argument(
+        "--disagreement_metric",
+        choices=("prob_jsd", "kernel_mmd"),
+        default="prob_jsd",
+    )
+    parser.add_argument("--kernel_bandwidth", default="median")
+    parser.add_argument(
+        "--kernel_pair_mode",
+        choices=("text_anchor", "full_pair"),
+        default="text_anchor",
+    )
+    parser.add_argument("--kernel_class_weight", type=float, default=0.5)
+    parser.add_argument("--kernel_max_class_samples", type=int, default=1024)
+    parser.add_argument(
         "--run_copa",
         action="store_true",
         help="Train and aggregate the label-aware CoPA prototype model.",
@@ -71,6 +101,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--copa_agr_weight", type=float, default=1.0)
     parser.add_argument("--copa_comp_weight", type=float, default=0.5)
     parser.add_argument("--copa_comp_margin", type=float, default=0.2)
+    parser.add_argument("--copa_orth_weight", type=float, default=0.01)
+    parser.add_argument(
+        "--copa_gate_metric",
+        choices=("prob_jsd", "kernel_mmd"),
+        default="prob_jsd",
+    )
+    parser.add_argument("--copa_kernel_bandwidth", default="median")
     parser.add_argument("--patience", type=int, default=8)
     parser.add_argument(
         "--deterministic",
@@ -310,9 +347,31 @@ def run_one_seed(args: argparse.Namespace, run_root: Path, seed: int, seen: set[
         *[str(value) for value in args.lambda_align_values],
         "--direct_add_alpha_values",
         *[str(value) for value in args.direct_add_alpha_values],
+        "--disagreement_metric",
+        args.disagreement_metric,
+        "--kernel_bandwidth",
+        str(args.kernel_bandwidth),
+        "--kernel_pair_mode",
+        args.kernel_pair_mode,
+        "--kernel_class_weight",
+        str(args.kernel_class_weight),
+        "--kernel_max_class_samples",
+        str(args.kernel_max_class_samples),
     ]
     if args.deterministic:
         command.append("--deterministic")
+    if args.run_infonce:
+        command.extend(
+            [
+                "--run_infonce",
+                "--lambda_nce_values",
+                *[str(value) for value in args.lambda_nce_values],
+                "--nce_temperature",
+                str(args.nce_temperature),
+                "--nce_pair_mode",
+                args.nce_pair_mode,
+            ]
+        )
     if args.run_copa:
         command.extend(
             [
@@ -327,6 +386,12 @@ def run_one_seed(args: argparse.Namespace, run_root: Path, seed: int, seen: set[
                 str(args.copa_comp_weight),
                 "--copa_comp_margin",
                 str(args.copa_comp_margin),
+                "--copa_orth_weight",
+                str(args.copa_orth_weight),
+                "--copa_gate_metric",
+                args.copa_gate_metric,
+                "--copa_kernel_bandwidth",
+                str(args.copa_kernel_bandwidth),
             ]
         )
     if args.quiet:
@@ -364,6 +429,15 @@ def main() -> int:
             "eta_unimodal": args.eta_unimodal,
             "lambda_align_values": args.lambda_align_values,
             "direct_add_alpha_values": args.direct_add_alpha_values,
+            "run_infonce": args.run_infonce,
+            "lambda_nce_values": args.lambda_nce_values,
+            "nce_temperature": args.nce_temperature,
+            "nce_pair_mode": args.nce_pair_mode,
+            "disagreement_metric": args.disagreement_metric,
+            "kernel_bandwidth": args.kernel_bandwidth,
+            "kernel_pair_mode": args.kernel_pair_mode,
+            "kernel_class_weight": args.kernel_class_weight,
+            "kernel_max_class_samples": args.kernel_max_class_samples,
             "run_copa": args.run_copa,
             "lambda_copa_values": args.lambda_copa_values,
             "tau_agreement": args.tau_agreement,
@@ -371,6 +445,9 @@ def main() -> int:
             "copa_agr_weight": args.copa_agr_weight,
             "copa_comp_weight": args.copa_comp_weight,
             "copa_comp_margin": args.copa_comp_margin,
+            "copa_orth_weight": args.copa_orth_weight,
+            "copa_gate_metric": args.copa_gate_metric,
+            "copa_kernel_bandwidth": args.copa_kernel_bandwidth,
             "patience": args.patience,
             "deterministic": args.deterministic,
             "error_min_seeds": args.error_min_seeds,
@@ -413,6 +490,29 @@ def main() -> int:
         run_dirs,
         "lambda_high_d_reliability_delta.csv",
     )
+    infonce_delta_all = pd.DataFrame()
+    infonce_reliability_delta_all = pd.DataFrame()
+    infonce_relation_state_delta_all = pd.DataFrame()
+    infonce_lambda_delta_all = pd.DataFrame()
+    infonce_lambda_reliability_delta_all = pd.DataFrame()
+    if args.run_infonce:
+        infonce_delta_all = read_seed_csv(run_dirs, "infonce_delta_metrics.csv")
+        infonce_reliability_delta_all = read_seed_csv(
+            run_dirs,
+            "infonce_high_d_reliability_delta.csv",
+        )
+        infonce_relation_state_delta_all = read_seed_csv(
+            run_dirs,
+            "infonce_relation_state_delta.csv",
+        )
+        infonce_lambda_delta_all = read_seed_csv(
+            run_dirs,
+            "infonce_lambda_test_delta_metrics.csv",
+        )
+        infonce_lambda_reliability_delta_all = read_seed_csv(
+            run_dirs,
+            "infonce_lambda_high_d_reliability_delta.csv",
+        )
     copa_delta_all = pd.DataFrame()
     copa_reliability_delta_all = pd.DataFrame()
     copa_relation_state_delta_all = pd.DataFrame()
@@ -518,6 +618,32 @@ def main() -> int:
         index=False,
         encoding="utf-8-sig",
     )
+    if args.run_infonce:
+        infonce_delta_all.to_csv(
+            summary_dir / "infonce_delta_all.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        infonce_reliability_delta_all.to_csv(
+            summary_dir / "infonce_high_d_reliability_delta_all.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        infonce_relation_state_delta_all.to_csv(
+            summary_dir / "infonce_relation_state_delta_all.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        infonce_lambda_delta_all.to_csv(
+            summary_dir / "infonce_lambda_test_delta_all.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        infonce_lambda_reliability_delta_all.to_csv(
+            summary_dir / "infonce_lambda_high_d_reliability_delta_all.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
     if args.run_copa:
         copa_delta_all.to_csv(
             summary_dir / "copa_delta_all.csv",
@@ -610,11 +736,16 @@ def main() -> int:
             "concat_macro_f1",
             "uncond_align_macro_f1",
             "direct_add_macro_f1",
+            "infonce_macro_f1",
             "soft_split_probe_macro_f1",
+            "text_anchor_probe_macro_f1",
             "residual_gain_macro_f1",
+            "text_anchor_residual_gain_macro_f1",
             "shuffled_residual_only_macro_f1",
+            "text_anchor_shuffled_residual_macro_f1",
             "lambda_align",
             "direct_add_alpha",
+            "lambda_nce",
         ],
     )
     feature_consistency_summary = flatten_summary(
@@ -638,6 +769,10 @@ def main() -> int:
             "common_residual_macro_f1",
             "residual_gain_macro_f1",
             "shuffled_residual_only_macro_f1",
+            "text_anchor_residual_only_macro_f1",
+            "text_anchor_common_residual_macro_f1",
+            "text_anchor_residual_gain_macro_f1",
+            "text_anchor_shuffled_residual_macro_f1",
         ],
     )
     selective_prototype_summary = flatten_summary(
@@ -667,6 +802,52 @@ def main() -> int:
         min_count=args.error_min_seeds,
         sign_rate_threshold=args.error_sign_rate,
     )
+    infonce_delta_summary = pd.DataFrame()
+    infonce_reliability_summary = pd.DataFrame()
+    infonce_relation_state_summary = pd.DataFrame()
+    infonce_lambda_delta_summary = pd.DataFrame()
+    infonce_lambda_reliability_summary = pd.DataFrame()
+    if args.run_infonce:
+        infonce_delta_summary = flatten_summary(
+            infonce_delta_all,
+            ["group"],
+            ["delta_acc", "delta_macro_f1", "lambda_nce"],
+            sign_cols=["delta_acc", "delta_macro_f1"],
+            min_count=args.error_min_seeds,
+            sign_rate_threshold=args.error_sign_rate,
+        )
+        infonce_reliability_summary = flatten_summary(
+            infonce_reliability_delta_all,
+            ["group"],
+            ["delta_acc", "delta_macro_f1", "lambda_nce"],
+            sign_cols=["delta_acc", "delta_macro_f1"],
+            min_count=args.error_min_seeds,
+            sign_rate_threshold=args.error_sign_rate,
+        )
+        infonce_relation_state_summary = flatten_summary(
+            infonce_relation_state_delta_all,
+            ["group"],
+            ["delta_acc", "delta_macro_f1", "lambda_nce"],
+            sign_cols=["delta_acc", "delta_macro_f1"],
+            min_count=args.error_min_seeds,
+            sign_rate_threshold=args.error_sign_rate,
+        )
+        infonce_lambda_delta_summary = flatten_summary(
+            infonce_lambda_delta_all,
+            ["lambda_nce", "group"],
+            ["delta_acc", "delta_macro_f1", "valid_macro_f1", "valid_acc"],
+            sign_cols=["delta_acc", "delta_macro_f1"],
+            min_count=args.error_min_seeds,
+            sign_rate_threshold=args.error_sign_rate,
+        )
+        infonce_lambda_reliability_summary = flatten_summary(
+            infonce_lambda_reliability_delta_all,
+            ["lambda_nce", "group"],
+            ["delta_acc", "delta_macro_f1", "valid_macro_f1", "valid_acc"],
+            sign_cols=["delta_acc", "delta_macro_f1"],
+            min_count=args.error_min_seeds,
+            sign_rate_threshold=args.error_sign_rate,
+        )
     relation_value_cols = [
         column
         for column in label_aware_relation_all.columns
@@ -799,6 +980,32 @@ def main() -> int:
         index=False,
         encoding="utf-8-sig",
     )
+    if args.run_infonce:
+        infonce_delta_summary.to_csv(
+            summary_dir / "infonce_delta_summary.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        infonce_reliability_summary.to_csv(
+            summary_dir / "infonce_high_d_reliability_summary.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        infonce_relation_state_summary.to_csv(
+            summary_dir / "infonce_relation_state_delta_summary.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        infonce_lambda_delta_summary.to_csv(
+            summary_dir / "infonce_lambda_test_delta_summary.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        infonce_lambda_reliability_summary.to_csv(
+            summary_dir / "infonce_lambda_high_d_reliability_summary.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
     label_aware_relation_summary.to_csv(
         summary_dir / "label_aware_relation_multi_seed_summary.csv",
         index=False,
@@ -844,6 +1051,20 @@ def main() -> int:
             ["lambda_align", "group"],
         ),
     ]
+    if args.run_infonce:
+        error_frames.extend(
+            [
+                ("infonce_delta", infonce_delta_summary, ["group"]),
+                ("infonce_high_d_reliability", infonce_reliability_summary, ["group"]),
+                ("infonce_relation_state", infonce_relation_state_summary, ["group"]),
+                ("lambda_nce_strength", infonce_lambda_delta_summary, ["lambda_nce", "group"]),
+                (
+                    "lambda_nce_high_d_reliability",
+                    infonce_lambda_reliability_summary,
+                    ["lambda_nce", "group"],
+                ),
+            ]
+        )
     if args.run_copa:
         error_frames.extend(
             [
@@ -906,6 +1127,40 @@ def main() -> int:
         "UncondAlign": relation_state_summary,
         "DirectAdd": direct_add_relation_state_summary,
     }
+    if args.run_infonce:
+        save_detailed_delta_plot(
+            infonce_delta_all,
+            infonce_delta_summary,
+            summary_dir / "infonce_delta_macro_f1_detailed.png",
+            title="InfoNCE gain by disagreement group",
+            ylabel="Delta Macro-F1 (UncondInfoNCE - Concat)",
+        )
+        save_detailed_delta_plot(
+            infonce_reliability_delta_all,
+            infonce_reliability_summary,
+            summary_dir / "infonce_high_d_reliability_delta_detailed.png",
+            group_order=HIGH_D_RELIABILITY_GROUP_ORDER,
+            title="InfoNCE on High-D reliability split",
+            ylabel="Delta Macro-F1 (UncondInfoNCE - Concat)",
+        )
+        save_detailed_delta_plot(
+            infonce_relation_state_delta_all,
+            infonce_relation_state_summary,
+            summary_dir / "infonce_relation_state_delta_detailed.png",
+            group_order=RELATION_STATE_GROUP_ORDER,
+            title="InfoNCE by relation state",
+            ylabel="Delta Macro-F1 (UncondInfoNCE - Concat)",
+        )
+        heatmap_summaries["UncondInfoNCE"] = infonce_relation_state_summary
+        save_lambda_curve_plot(
+            infonce_lambda_delta_summary,
+            summary_dir / "infonce_lambda_delta_macro_f1_curve.png",
+            title="Multi-seed InfoNCE strength curve",
+            x_col="lambda_nce",
+            x_label="lambda_nce",
+            y_label="Delta Macro-F1 (UncondInfoNCE - Concat)",
+            raw_frame=infonce_lambda_delta_all,
+        )
     if args.run_copa:
         save_detailed_delta_plot(
             copa_delta_all,
@@ -960,6 +1215,11 @@ def main() -> int:
     print(residual_probe_summary.to_string(index=False))
     print("\nLambda strength delta summary:")
     print(lambda_delta_summary.to_string(index=False))
+    if args.run_infonce:
+        print("\nInfoNCE delta summary:")
+        print(infonce_delta_summary.to_string(index=False))
+        print("\nInfoNCE lambda strength delta summary:")
+        print(infonce_lambda_delta_summary.to_string(index=False))
     if args.run_copa:
         print("\nCoPA delta summary:")
         print(copa_delta_summary.to_string(index=False))

@@ -78,8 +78,23 @@ def main() -> int:
             "0.05",
             "--direct_add_alpha_values",
             "0.1",
+            "--run_infonce",
+            "--lambda_nce_values",
+            "0.01",
+            "--nce_pair_mode",
+            "text_anchor",
+            "--disagreement_metric",
+            "kernel_mmd",
+            "--kernel_pair_mode",
+            "text_anchor",
+            "--kernel_max_class_samples",
+            "32",
             "--run_copa",
             "--lambda_copa_values",
+            "0.01",
+            "--copa_gate_metric",
+            "kernel_mmd",
+            "--copa_orth_weight",
             "0.01",
             "--patience",
             "2",
@@ -115,6 +130,12 @@ def main() -> int:
             "direct_add_alpha_test_delta_metrics.csv",
             "direct_add_delta_metrics.csv",
             "direct_add_relation_state_delta.csv",
+            "infonce_lambda_sweep_valid.csv",
+            "infonce_lambda_test_delta_metrics.csv",
+            "infonce_delta_metrics.csv",
+            "infonce_high_d_reliability_delta.csv",
+            "infonce_lambda_high_d_reliability_delta.csv",
+            "infonce_relation_state_delta.csv",
             "concat_aware_motivation.csv",
             "feature_consistency_diagnostic.csv",
             "residual_distribution_diagnostic.csv",
@@ -173,11 +194,40 @@ def main() -> int:
             "g_tv_agr",
             "g_tv_comp",
             "g_tv_noise",
+            "disagreement_metric",
+            "kernel_pair_mode",
         }
         missing_label_aware = sorted(label_aware_columns - set(label_aware.columns))
         if missing_label_aware:
             print(
                 f"Smoke test failed: missing label-aware columns {missing_label_aware}",
+                file=sys.stderr,
+            )
+            return 1
+        if set(label_aware["disagreement_metric"]) != {"kernel_mmd"}:
+            print(
+                "Smoke test failed: label-aware relation frame did not use kernel_mmd.",
+                file=sys.stderr,
+            )
+            return 1
+        infonce_sweep = pd.read_csv(latest / "infonce_lambda_sweep_valid.csv")
+        if infonce_sweep.empty or set(infonce_sweep["nce_pair_mode"]) != {"text_anchor"}:
+            print(
+                "Smoke test failed: InfoNCE text_anchor sweep is empty or has wrong pair mode.",
+                file=sys.stderr,
+            )
+            return 1
+        residual_probe = pd.read_csv(latest / "residual_discriminative_probe.csv")
+        residual_columns = {
+            "text_anchor_residual_only_macro_f1",
+            "text_anchor_common_residual_macro_f1",
+            "text_anchor_residual_gain_macro_f1",
+            "text_anchor_shuffled_residual_macro_f1",
+        }
+        missing_residual = sorted(residual_columns - set(residual_probe.columns))
+        if missing_residual:
+            print(
+                f"Smoke test failed: missing text-anchor residual columns {missing_residual}",
                 file=sys.stderr,
             )
             return 1

@@ -80,8 +80,23 @@ def main() -> int:
             "0.01",
             "--direct_add_alpha_values",
             "0.1",
+            "--run_infonce",
+            "--lambda_nce_values",
+            "0.01",
+            "--nce_pair_mode",
+            "text_anchor",
+            "--disagreement_metric",
+            "kernel_mmd",
+            "--kernel_pair_mode",
+            "text_anchor",
+            "--kernel_max_class_samples",
+            "32",
             "--run_copa",
             "--lambda_copa_values",
+            "0.01",
+            "--copa_gate_metric",
+            "kernel_mmd",
+            "--copa_orth_weight",
             "0.01",
             "--patience",
             "1",
@@ -128,6 +143,16 @@ def main() -> int:
             "lambda_test_delta_summary.csv",
             "lambda_high_d_reliability_delta_all.csv",
             "lambda_high_d_reliability_summary.csv",
+            "infonce_delta_all.csv",
+            "infonce_delta_summary.csv",
+            "infonce_high_d_reliability_delta_all.csv",
+            "infonce_high_d_reliability_summary.csv",
+            "infonce_relation_state_delta_all.csv",
+            "infonce_relation_state_delta_summary.csv",
+            "infonce_lambda_test_delta_all.csv",
+            "infonce_lambda_test_delta_summary.csv",
+            "infonce_lambda_high_d_reliability_delta_all.csv",
+            "infonce_lambda_high_d_reliability_summary.csv",
             "copa_delta_all.csv",
             "copa_delta_summary.csv",
             "copa_high_d_reliability_delta_all.csv",
@@ -145,6 +170,10 @@ def main() -> int:
             "relation_state_delta_detailed.png",
             "direct_add_relation_state_delta_detailed.png",
             "lambda_delta_macro_f1_curve.png",
+            "infonce_lambda_delta_macro_f1_curve.png",
+            "infonce_delta_macro_f1_detailed.png",
+            "infonce_high_d_reliability_delta_detailed.png",
+            "infonce_relation_state_delta_detailed.png",
             "copa_lambda_delta_macro_f1_curve.png",
             "copa_delta_macro_f1_detailed.png",
             "copa_high_d_reliability_delta_detailed.png",
@@ -173,6 +202,24 @@ def main() -> int:
                 f"Multi-seed smoke test failed: missing error-control columns {missing_columns}",
                 file=sys.stderr,
             )
+            return 1
+        residual_summary = pd.read_csv(summary / "residual_discriminative_probe_summary.csv")
+        residual_columns = {
+            "text_anchor_residual_only_macro_f1_mean",
+            "text_anchor_common_residual_macro_f1_mean",
+            "text_anchor_residual_gain_macro_f1_mean",
+            "text_anchor_shuffled_residual_macro_f1_mean",
+        }
+        missing_residual = sorted(residual_columns - set(residual_summary.columns))
+        if missing_residual:
+            print(
+                f"Multi-seed smoke test failed: missing text-anchor residual summary columns {missing_residual}",
+                file=sys.stderr,
+            )
+            return 1
+        infonce_summary = pd.read_csv(summary / "infonce_lambda_test_delta_summary.csv")
+        if infonce_summary.empty or "lambda_nce" not in infonce_summary.columns:
+            print("Multi-seed smoke test failed: InfoNCE summary is empty.", file=sys.stderr)
             return 1
         print(f"Multi-seed smoke test passed. Outputs checked in {summary}")
         return 0

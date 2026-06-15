@@ -92,6 +92,22 @@ def residual_parts(
     return common_features, residual_features, combined_features
 
 
+def text_anchor_residual_parts(
+    pred: dict[str, np.ndarray],
+    means: dict[str, np.ndarray],
+) -> tuple[np.ndarray, np.ndarray]:
+    common_features, _, _ = residual_parts(pred, means)
+    residual_features = np.concatenate(
+        [
+            np.abs(pred["h_t"] - pred["h_a"]),
+            np.abs(pred["h_t"] - pred["h_v"]),
+        ],
+        axis=1,
+    )
+    combined_features = np.concatenate([common_features, residual_features], axis=1)
+    return residual_features, combined_features
+
+
 def residual_diagnostic_frame(
     pred: dict[str, np.ndarray],
     d_pred: np.ndarray,
@@ -189,6 +205,14 @@ def residual_probe_frame(
 ) -> pd.DataFrame:
     train_common, train_residual, train_combined = residual_parts(train_pred, means)
     test_common, test_residual, test_combined = residual_parts(test_pred, means)
+    train_text_anchor_residual, train_text_anchor_combined = text_anchor_residual_parts(
+        train_pred,
+        means,
+    )
+    test_text_anchor_residual, test_text_anchor_combined = text_anchor_residual_parts(
+        test_pred,
+        means,
+    )
     y_train = train_pred["y_true"].astype(np.int64)
     y_test = test_pred["y_true"].astype(np.int64)
     rng = np.random.default_rng(seed)
@@ -217,12 +241,33 @@ def residual_probe_frame(
             y_test[test_mask],
             seed,
         )
+        text_anchor_residual_metrics = _fit_probe(
+            train_text_anchor_residual[train_mask],
+            y_train[train_mask],
+            test_text_anchor_residual[test_mask],
+            y_test[test_mask],
+            seed,
+        )
+        text_anchor_combined_metrics = _fit_probe(
+            train_text_anchor_combined[train_mask],
+            y_train[train_mask],
+            test_text_anchor_combined[test_mask],
+            y_test[test_mask],
+            seed,
+        )
         shuffled_labels = y_train[train_mask].copy()
         rng.shuffle(shuffled_labels)
         shuffled_metrics = _fit_probe(
             train_residual[train_mask],
             shuffled_labels,
             test_residual[test_mask],
+            y_test[test_mask],
+            seed,
+        )
+        text_anchor_shuffled_metrics = _fit_probe(
+            train_text_anchor_residual[train_mask],
+            shuffled_labels,
+            test_text_anchor_residual[test_mask],
             y_test[test_mask],
             seed,
         )
@@ -240,6 +285,19 @@ def residual_probe_frame(
                 "residual_gain_macro_f1": combined_metrics["macro_f1"]
                 - common_metrics["macro_f1"],
                 "shuffled_residual_only_macro_f1": shuffled_metrics["macro_f1"],
+                "text_anchor_residual_only_macro_f1": text_anchor_residual_metrics[
+                    "macro_f1"
+                ],
+                "text_anchor_common_residual_macro_f1": text_anchor_combined_metrics[
+                    "macro_f1"
+                ],
+                "text_anchor_residual_gain_macro_f1": text_anchor_combined_metrics[
+                    "macro_f1"
+                ]
+                - common_metrics["macro_f1"],
+                "text_anchor_shuffled_residual_macro_f1": text_anchor_shuffled_metrics[
+                    "macro_f1"
+                ],
             }
         )
     return pd.DataFrame(rows)

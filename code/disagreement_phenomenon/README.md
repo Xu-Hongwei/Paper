@@ -198,12 +198,57 @@ DirectAdd is intentionally not relation-aware. If it is unstable on RD
 addition is not enough; relation-conditioned soft decomposition is needed.
 DirectAdd is a motivation baseline, not a CoPA component.
 
+### Unconditional InfoNCE Baseline
+
+Enable same-sample InfoNCE with:
+
+```powershell
+python -B code\disagreement_phenomenon\scripts\run_multi_seed.py --dataset mosei --data_root E:\Xu\data\MultiBench --seeds 1 2 3 4 5 --batch_size 1024 --num_workers 0 --epochs 25 --patience 6 --quiet --run_infonce --nce_pair_mode text_anchor --deterministic
+```
+
+The default text-anchor mode only uses:
+
+```text
+text <-> audio
+text <-> vision
+```
+
+It does not train an audio-vision alignment loss. To run the full-pair
+counterpart, use:
+
+```powershell
+python -B code\disagreement_phenomenon\scripts\run_multi_seed.py --dataset mosei --data_root E:\Xu\data\MultiBench --seeds 1 2 3 4 5 --batch_size 1024 --num_workers 0 --epochs 25 --patience 6 --quiet --run_infonce --nce_pair_mode full_pair --deterministic
+```
+
+The sweep uses:
+
+```text
+lambda_nce = 0.01, 0.05, 0.1, 0.5
+nce_temperature = 0.1
+```
+
 ### Experiment 1-v4 diagnostics
 
-Motivation grouping uses validation thresholds only. The validation set defines
-Low/Mid/High-D by the 1/3 and 2/3 quantiles of prediction-distribution
-disagreement, and defines High/Low-R by the median entropy reliability. The
-test set only applies these thresholds.
+Motivation grouping uses validation thresholds only. By default, the validation
+set defines Low/Mid/High-D by the 1/3 and 2/3 quantiles of
+prediction-distribution JSD disagreement, and defines High/Low-R by the median
+entropy reliability. The test set only applies these thresholds.
+
+The disagreement score can also be switched to a unified-hidden RBF kernel
+variant:
+
+```powershell
+--disagreement_metric kernel_mmd --kernel_pair_mode text_anchor
+```
+
+In this mode, the diagnostic model first maps text/audio/vision into the same
+hidden dimension. Pairwise D combines a paired RBF point distance with a
+predicted-class conditional MMD estimate, using the diagnostic fusion
+prediction as the class partition. `text_anchor` averages T-A and T-V for
+`D_sample`; `full_pair` also includes A-V. This metric is a candidate
+modality-distribution discrepancy signal, not proof that the discrepancy is
+useful complementary information. The residual probe and RD subgroup results
+are still the evidence for discriminative value.
 
 The exported relation states are:
 
@@ -228,7 +273,7 @@ This table is for motivation only. It tests whether relation states provide
 meaningful diagnostic signals beyond ordinary concatenation, fixed-strength
 alignment, and direct feature addition.
 
-### CoPA Prototype Baseline
+### CoPA-v5 Text-Anchor Baseline
 
 Enable it with:
 
@@ -242,7 +287,18 @@ or multi-seed:
 python -B code\disagreement_phenomenon\scripts\run_multi_seed.py --dataset mosei --data_root E:\Xu\data\MultiBench --seeds 1 2 3 4 5 6 7 8 9 10 --batch_size 1024 --num_workers 0 --epochs 25 --patience 6 --quiet --run_copa
 ```
 
-CoPA uses label-aware reliability during supervised training:
+CoPA now follows the v5 text-anchor design. It keeps the supervised fusion path
+unchanged, uses common projections for unimodal prediction and RA alignment,
+and uses residual projections for RD prototype-NCE. The training loss only uses
+text-anchor modality pairs:
+
+```text
+text <-> audio
+text <-> vision
+```
+
+It does not train an audio-vision CoPA loss. CoPA uses label-aware reliability
+during supervised training:
 
 ```text
 C_m = 1 - H(p_m) / log(K)
@@ -250,11 +306,20 @@ S_m = p_m(y)
 R_label_m = C_m * S_m
 ```
 
-Then pairwise agreement is:
+Then pairwise agreement is, by default:
 
 ```text
 A_ij = exp(-JSD(p_i, p_j) / tau_agreement)
 ```
+
+CoPA training gates can be switched to batch-local hidden-space RBF distance:
+
+```powershell
+--copa_gate_metric kernel_mmd --copa_kernel_bandwidth median
+```
+
+This uses the same common hidden space as RA alignment. It is intentionally a
+gate signal rather than a direct claim that all disagreement is complementary.
 
 and the relation gates are:
 
@@ -269,25 +334,41 @@ The exported `g_ij_comp` columns are kept as backward-compatible aliases for
 `g_ij_dis`. This gate allows a reliable contrastive modality to contribute to
 disagreement learning when at least one modality strongly supports the label.
 
-The current CoPA loss combines:
+The current CoPA-v5 loss combines:
 
 ```text
-prototype alignment: reliable modality -> true-label prototype
-agreement alignment: reliable agreeing modality pairs -> pull together
-competition margin: reliable disagreeing modality pairs -> avoid over-alignment
+RA-gated common InfoNCE: reliable agreeing text-anchor pairs -> align common semantics
+RD residual prototype-NCE: reliable disagreeing text-anchor residuals -> classify residual structure
+common-residual orthogonality: reduce redundancy between z^c and z^r
 ```
+
+The orthogonality term is a redundancy-control regularizer only. It encourages
+common and residual projections to avoid linear overlap, but it does not by
+itself prove that the residual contains useful complementary evidence; that
+still needs residual probe and subgroup analysis.
 
 The CoPA sweep uses:
 
 ```text
 lambda_copa = 0.01, 0.05, 0.1
+copa_orth_weight = 0.01  # light redundancy control; 0.05 can over-regularize on MOSI seed 1
+```
+
+The legacy CLI names are kept for compatibility:
+
+```text
+copa_agr_weight   -> RA-gated common InfoNCE weight
+copa_comp_weight  -> RD residual prototype-NCE weight
+copa_proto_weight -> multiplier on the residual prototype-NCE term
+copa_orth_weight  -> common-residual redundancy reduction weight
+copa_gate_metric  -> prob_jsd or kernel_mmd gate source
 ```
 
 Important distinction:
 
 ```text
 Motivation grouping on validation/test does not use labels.
-CoPA supervised prototype training uses train labels through p_m(y).
+CoPA-v5 supervised relation gates use train labels through p_m(y).
 ```
 
 This avoids test-label leakage while still preventing confidently wrong training
@@ -410,6 +491,18 @@ residual_discriminative_probe.csv
 selective_agreement_prototype_check.csv
 ```
 
+Additional InfoNCE outputs when `--run_infonce` is used:
+
+```text
+infonce_delta_metrics.csv
+infonce_lambda_sweep_valid.csv
+infonce_lambda_test_delta_metrics.csv
+infonce_high_d_reliability_delta.csv
+infonce_lambda_high_d_reliability_delta.csv
+infonce_relation_state_delta.csv
+infonce_model.pt
+```
+
 Additional CoPA outputs when `--run_copa` is used:
 
 ```text
@@ -444,6 +537,25 @@ feature_consistency_diagnostic_summary.csv
 residual_distribution_diagnostic_summary.csv
 residual_discriminative_probe_summary.csv
 selective_agreement_prototype_check_summary.csv
+```
+
+Additional multi-seed InfoNCE outputs when `--run_infonce` is used:
+
+```text
+infonce_delta_all.csv
+infonce_delta_summary.csv
+infonce_high_d_reliability_delta_all.csv
+infonce_high_d_reliability_summary.csv
+infonce_relation_state_delta_all.csv
+infonce_relation_state_delta_summary.csv
+infonce_lambda_test_delta_all.csv
+infonce_lambda_test_delta_summary.csv
+infonce_lambda_high_d_reliability_delta_all.csv
+infonce_lambda_high_d_reliability_summary.csv
+infonce_delta_macro_f1_detailed.png
+infonce_high_d_reliability_delta_detailed.png
+infonce_relation_state_delta_detailed.png
+infonce_lambda_delta_macro_f1_curve.png
 ```
 
 The multi-seed summary directory also keeps the corresponding per-seed merged

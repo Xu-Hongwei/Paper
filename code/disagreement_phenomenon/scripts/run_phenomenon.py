@@ -25,11 +25,14 @@ from src.disagreement import (  # noqa: E402
     build_group_frame,
     build_label_aware_relation_frame,
     grouped_metrics,
+    kernel_pairwise_disagreement,
     pairwise_disagreement,
     reliability_threshold,
     relation_gates,
+    resolve_kernel_bandwidth,
     rows_for_method,
     sample_disagreement,
+    sample_disagreement_from_pairwise,
     sample_reliability,
     summarize_relation_frame,
     validation_thresholds,
@@ -84,6 +87,53 @@ def parse_args() -> argparse.Namespace:
         help="Alpha sweep for DirectAdd: h_m + alpha * mean(h_t,h_v,h_a).",
     )
     parser.add_argument(
+        "--run_infonce",
+        action="store_true",
+        help="Train unconditional same-sample InfoNCE baselines.",
+    )
+    parser.add_argument(
+        "--lambda_nce_values",
+        type=float,
+        nargs="+",
+        default=[0.01, 0.05, 0.1, 0.5],
+    )
+    parser.add_argument("--nce_temperature", type=float, default=0.1)
+    parser.add_argument(
+        "--nce_pair_mode",
+        choices=("text_anchor", "full_pair"),
+        default="text_anchor",
+        help="text_anchor uses T-A/T-V only; full_pair also adds A-V.",
+    )
+    parser.add_argument(
+        "--disagreement_metric",
+        choices=("prob_jsd", "kernel_mmd"),
+        default="prob_jsd",
+        help="Metric used for Low/Mid/High-D and relation-state diagnostics.",
+    )
+    parser.add_argument(
+        "--kernel_bandwidth",
+        default="median",
+        help="RBF bandwidth for kernel_mmd diagnostics; use 'median' or a positive number.",
+    )
+    parser.add_argument(
+        "--kernel_pair_mode",
+        choices=("text_anchor", "full_pair"),
+        default="text_anchor",
+        help="text_anchor averages T-A/T-V for kernel D_sample; full_pair also uses A-V.",
+    )
+    parser.add_argument(
+        "--kernel_class_weight",
+        type=float,
+        default=0.5,
+        help="Blend weight for predicted-class MMD versus paired RBF distance.",
+    )
+    parser.add_argument(
+        "--kernel_max_class_samples",
+        type=int,
+        default=1024,
+        help="Maximum predicted-class samples used for each class-conditional MMD.",
+    )
+    parser.add_argument(
         "--run_copa",
         action="store_true",
         help="Train the label-aware CoPA prototype model in addition to baselines.",
@@ -104,6 +154,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--copa_agr_weight", type=float, default=1.0)
     parser.add_argument("--copa_comp_weight", type=float, default=0.5)
     parser.add_argument("--copa_comp_margin", type=float, default=0.2)
+    parser.add_argument("--copa_orth_weight", type=float, default=0.01)
+    parser.add_argument(
+        "--copa_gate_metric",
+        choices=("prob_jsd", "kernel_mmd"),
+        default="prob_jsd",
+        help="Metric used inside CoPA RA/RD gates during training.",
+    )
+    parser.add_argument(
+        "--copa_kernel_bandwidth",
+        default="median",
+        help="RBF bandwidth for CoPA kernel_mmd gates; use 'median' or a positive number.",
+    )
     parser.add_argument("--patience", type=int, default=8)
     parser.add_argument(
         "--deterministic",
@@ -157,6 +219,56 @@ def make_loaders(
             worker_init_fn=seed_worker if num_workers > 0 else None,
         ),
     }
+
+
+def disagreement_distances(
+    pred: dict[str, np.ndarray],
+    cfg: ExperimentConfig,
+    *,
+    kernel_bandwidth: str | float | None = None,
+    seed_offset: int = 0,
+) -> dict[str, np.ndarray]:
+    if cfg.disagreement_metric == "prob_jsd":
+        return pairwise_disagreement(pred["prob_t"], pred["prob_v"], pred["prob_a"])
+    if cfg.disagreement_metric == "kernel_mmd":
+        return kernel_pairwise_disagreement(
+            pred["h_t"],
+            pred["h_v"],
+            pred["h_a"],
+            pred["y_pred"],
+            bandwidth=cfg.kernel_bandwidth if kernel_bandwidth is None else kernel_bandwidth,
+            class_weight=cfg.kernel_class_weight,
+            max_class_samples=cfg.kernel_max_class_samples,
+            seed=cfg.seed + seed_offset,
+        )
+    raise ValueError("disagreement_metric must be 'prob_jsd' or 'kernel_mmd'.")
+
+
+def sample_disagreement_for_run(
+    pred: dict[str, np.ndarray],
+    cfg: ExperimentConfig,
+    *,
+    kernel_bandwidth: str | float | None = None,
+    seed_offset: int = 0,
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    distances = disagreement_distances(
+        pred,
+        cfg,
+        kernel_bandwidth=kernel_bandwidth,
+        seed_offset=seed_offset,
+    )
+    if cfg.disagreement_metric == "kernel_mmd":
+        sample = sample_disagreement_from_pairwise(
+            distances,
+            pair_mode=cfg.kernel_pair_mode,
+        )
+    else:
+        sample = sample_disagreement(
+            pred["prob_t"],
+            pred["prob_v"],
+            pred["prob_a"],
+        )
+    return sample, distances
 
 
 def new_model(
@@ -423,6 +535,137 @@ def train_best_direct_add(
     )
 
 
+def train_best_infonce(
+    input_dims: dict[str, int],
+    loaders: dict[str, DataLoader],
+    cfg: ExperimentConfig,
+    device: torch.device,
+    concat_grouped: dict[str, dict[str, float]],
+    concat_reliability_grouped: dict[str, dict[str, float]],
+    test_groups,
+    test_reliability_groups,
+) -> tuple[
+    MultimodalClassifier,
+    dict[str, float],
+    float,
+    list[dict[str, float]],
+    dict[str, dict[str, float]],
+    dict[str, dict[str, float]],
+    list[dict[str, float]],
+    list[dict[str, float]],
+]:
+    best_model: MultimodalClassifier | None = None
+    best_metrics: dict[str, float] = {}
+    best_grouped: dict[str, dict[str, float]] = {}
+    best_reliability_grouped: dict[str, dict[str, float]] = {}
+    best_lambda = cfg.lambda_nce_values[0]
+    best_score = -1.0
+    sweep_rows: list[dict[str, float]] = []
+    lambda_delta_rows: list[dict[str, float]] = []
+    lambda_reliability_delta_rows: list[dict[str, float]] = []
+
+    for lambda_nce in cfg.lambda_nce_values:
+        model = new_model(input_dims, cfg)
+        trained, metrics = train_model(
+            model,
+            loaders["train"],
+            loaders["valid"],
+            device,
+            epochs=cfg.epochs,
+            lr=cfg.lr,
+            weight_decay=cfg.weight_decay,
+            eta_unimodal=0.0,
+            lambda_nce=lambda_nce,
+            nce_temperature=cfg.nce_temperature,
+            nce_pair_mode=cfg.nce_pair_mode,
+            patience=cfg.patience,
+            desc=f"InfoNCE λ={lambda_nce}",
+            show_progress=not cfg.quiet,
+        )
+        score = metrics.get("macro_f1", -1.0)
+        sweep_rows.append(
+            {
+                "lambda_nce": lambda_nce,
+                "nce_temperature": cfg.nce_temperature,
+                "nce_pair_mode": cfg.nce_pair_mode,
+                **metrics,
+            }
+        )
+
+        infonce_pred = predict(trained, loaders["test"], device)
+        infonce_grouped = grouped_metrics(
+            infonce_pred["y_true"],
+            infonce_pred["y_pred"],
+            test_groups,
+        )
+        infonce_reliability_grouped = grouped_metrics(
+            infonce_pred["y_true"],
+            infonce_pred["y_pred"],
+            test_reliability_groups,
+            group_order=HIGH_D_RELIABILITY_GROUP_ORDER,
+            include_overall=False,
+        )
+        for group in ("Low-D", "Mid-D", "High-D", "Overall"):
+            lambda_delta_rows.append(
+                {
+                    "lambda_nce": lambda_nce,
+                    "nce_temperature": cfg.nce_temperature,
+                    "nce_pair_mode": cfg.nce_pair_mode,
+                    "group": group,
+                    "n": infonce_grouped[group]["n"],
+                    "concat_acc": concat_grouped[group]["acc"],
+                    "infonce_acc": infonce_grouped[group]["acc"],
+                    "delta_acc": infonce_grouped[group]["acc"] - concat_grouped[group]["acc"],
+                    "concat_macro_f1": concat_grouped[group]["macro_f1"],
+                    "infonce_macro_f1": infonce_grouped[group]["macro_f1"],
+                    "delta_macro_f1": infonce_grouped[group]["macro_f1"]
+                    - concat_grouped[group]["macro_f1"],
+                    "valid_macro_f1": metrics.get("macro_f1"),
+                    "valid_acc": metrics.get("acc"),
+                }
+            )
+        for group in HIGH_D_RELIABILITY_GROUP_ORDER:
+            lambda_reliability_delta_rows.append(
+                {
+                    "lambda_nce": lambda_nce,
+                    "nce_temperature": cfg.nce_temperature,
+                    "nce_pair_mode": cfg.nce_pair_mode,
+                    "group": group,
+                    "n": infonce_reliability_grouped[group]["n"],
+                    "concat_acc": concat_reliability_grouped[group]["acc"],
+                    "infonce_acc": infonce_reliability_grouped[group]["acc"],
+                    "delta_acc": infonce_reliability_grouped[group]["acc"]
+                    - concat_reliability_grouped[group]["acc"],
+                    "concat_macro_f1": concat_reliability_grouped[group]["macro_f1"],
+                    "infonce_macro_f1": infonce_reliability_grouped[group]["macro_f1"],
+                    "delta_macro_f1": infonce_reliability_grouped[group]["macro_f1"]
+                    - concat_reliability_grouped[group]["macro_f1"],
+                    "valid_macro_f1": metrics.get("macro_f1"),
+                    "valid_acc": metrics.get("acc"),
+                }
+            )
+        if score > best_score:
+            best_score = score
+            best_model = trained
+            best_metrics = metrics
+            best_grouped = infonce_grouped
+            best_reliability_grouped = infonce_reliability_grouped
+            best_lambda = lambda_nce
+
+    if best_model is None:
+        raise RuntimeError("InfoNCE sweep did not train any model.")
+    return (
+        best_model,
+        best_metrics,
+        best_lambda,
+        sweep_rows,
+        best_grouped,
+        best_reliability_grouped,
+        lambda_delta_rows,
+        lambda_reliability_delta_rows,
+    )
+
+
 def train_best_copa(
     input_dims: dict[str, int],
     loaders: dict[str, DataLoader],
@@ -470,6 +713,9 @@ def train_best_copa(
             copa_agr_weight=cfg.copa_agr_weight,
             copa_comp_weight=cfg.copa_comp_weight,
             copa_comp_margin=cfg.copa_comp_margin,
+            copa_orth_weight=cfg.copa_orth_weight,
+            copa_gate_metric=cfg.copa_gate_metric,
+            copa_kernel_bandwidth=cfg.copa_kernel_bandwidth,
             patience=cfg.patience,
             desc=f"CoPA λ={lambda_copa}",
             show_progress=not cfg.quiet,
@@ -564,6 +810,15 @@ def main() -> int:
         eta_unimodal=args.eta_unimodal,
         lambda_align_values=args.lambda_align_values,
         direct_add_alpha_values=args.direct_add_alpha_values,
+        run_infonce=args.run_infonce,
+        lambda_nce_values=args.lambda_nce_values,
+        nce_temperature=args.nce_temperature,
+        nce_pair_mode=args.nce_pair_mode,
+        disagreement_metric=args.disagreement_metric,
+        kernel_bandwidth=args.kernel_bandwidth,
+        kernel_pair_mode=args.kernel_pair_mode,
+        kernel_class_weight=args.kernel_class_weight,
+        kernel_max_class_samples=args.kernel_max_class_samples,
         run_copa=args.run_copa,
         lambda_copa_values=args.lambda_copa_values,
         tau_agreement=args.tau_agreement,
@@ -571,6 +826,9 @@ def main() -> int:
         copa_agr_weight=args.copa_agr_weight,
         copa_comp_weight=args.copa_comp_weight,
         copa_comp_margin=args.copa_comp_margin,
+        copa_orth_weight=args.copa_orth_weight,
+        copa_gate_metric=args.copa_gate_metric,
+        copa_kernel_bandwidth=args.copa_kernel_bandwidth,
         patience=args.patience,
         deterministic=args.deterministic,
         quiet=args.quiet,
@@ -616,6 +874,15 @@ def main() -> int:
             "eta_unimodal": cfg.eta_unimodal,
             "lambda_align_values": cfg.lambda_align_values,
             "direct_add_alpha_values": cfg.direct_add_alpha_values,
+            "run_infonce": cfg.run_infonce,
+            "lambda_nce_values": cfg.lambda_nce_values,
+            "nce_temperature": cfg.nce_temperature,
+            "nce_pair_mode": cfg.nce_pair_mode,
+            "disagreement_metric": cfg.disagreement_metric,
+            "kernel_bandwidth": cfg.kernel_bandwidth,
+            "kernel_pair_mode": cfg.kernel_pair_mode,
+            "kernel_class_weight": cfg.kernel_class_weight,
+            "kernel_max_class_samples": cfg.kernel_max_class_samples,
             "run_copa": cfg.run_copa,
             "lambda_copa_values": cfg.lambda_copa_values,
             "tau_agreement": cfg.tau_agreement,
@@ -623,6 +890,9 @@ def main() -> int:
             "copa_agr_weight": cfg.copa_agr_weight,
             "copa_comp_weight": cfg.copa_comp_weight,
             "copa_comp_margin": cfg.copa_comp_margin,
+            "copa_orth_weight": cfg.copa_orth_weight,
+            "copa_gate_metric": cfg.copa_gate_metric,
+            "copa_kernel_bandwidth": cfg.copa_kernel_bandwidth,
             "deterministic": cfg.deterministic,
             "input_dims": input_dims,
             "quiet": cfg.quiet,
@@ -633,13 +903,34 @@ def main() -> int:
     train_diag = predict(diagnostic_model, loaders["train"], device)
     valid_diag = predict(diagnostic_model, loaders["valid"], device)
     test_diag = predict(diagnostic_model, loaders["test"], device)
+    resolved_kernel_bandwidth: str | float = cfg.kernel_bandwidth
+    if cfg.disagreement_metric == "kernel_mmd":
+        resolved_kernel_bandwidth = resolve_kernel_bandwidth(
+            valid_diag["h_t"],
+            valid_diag["h_v"],
+            valid_diag["h_a"],
+            cfg.kernel_bandwidth,
+            seed=cfg.seed,
+        )
     train_label_aware = build_label_aware_relation_frame(
         train_diag,
         tau_agreement=cfg.tau_agreement,
+        disagreement_metric=cfg.disagreement_metric,
+        kernel_bandwidth=resolved_kernel_bandwidth,
+        kernel_pair_mode=cfg.kernel_pair_mode,
+        kernel_class_weight=cfg.kernel_class_weight,
+        kernel_max_class_samples=cfg.kernel_max_class_samples,
+        seed=cfg.seed + 10,
     )
     valid_label_aware = build_label_aware_relation_frame(
         valid_diag,
         tau_agreement=cfg.tau_agreement,
+        disagreement_metric=cfg.disagreement_metric,
+        kernel_bandwidth=resolved_kernel_bandwidth,
+        kernel_pair_mode=cfg.kernel_pair_mode,
+        kernel_class_weight=cfg.kernel_class_weight,
+        kernel_max_class_samples=cfg.kernel_max_class_samples,
+        seed=cfg.seed + 20,
     )
     train_label_aware.to_csv(
         run_dir / "train_label_aware_relations.csv",
@@ -661,14 +952,23 @@ def main() -> int:
         index=False,
         encoding="utf-8-sig",
     )
-    train_d = sample_disagreement(
-        train_diag["prob_t"], train_diag["prob_v"], train_diag["prob_a"]
+    train_d, train_distances = sample_disagreement_for_run(
+        train_diag,
+        cfg,
+        kernel_bandwidth=resolved_kernel_bandwidth,
+        seed_offset=30,
     )
-    valid_d = sample_disagreement(
-        valid_diag["prob_t"], valid_diag["prob_v"], valid_diag["prob_a"]
+    valid_d, valid_distances = sample_disagreement_for_run(
+        valid_diag,
+        cfg,
+        kernel_bandwidth=resolved_kernel_bandwidth,
+        seed_offset=40,
     )
-    test_d = sample_disagreement(
-        test_diag["prob_t"], test_diag["prob_v"], test_diag["prob_a"]
+    test_d, test_distances = sample_disagreement_for_run(
+        test_diag,
+        cfg,
+        kernel_bandwidth=resolved_kernel_bandwidth,
+        seed_offset=50,
     )
     q33, q66 = validation_thresholds(valid_d)
     train_groups = assign_groups(train_d, q33, q66)
@@ -694,7 +994,7 @@ def main() -> int:
         q_r,
     )
     test_relations = {
-        **pairwise_disagreement(test_diag["prob_t"], test_diag["prob_v"], test_diag["prob_a"]),
+        **test_distances,
         **relation_gates(
             test_diag["prob_t"],
             test_diag["prob_v"],
@@ -702,6 +1002,7 @@ def main() -> int:
             test_reliability,
             cfg.tau_agreement,
             prefix="R_",
+            distances=test_distances,
         ),
     }
     test_reliability_groups = assign_high_d_reliability_groups(
@@ -717,6 +1018,11 @@ def main() -> int:
         reliability_groups=test_reliability_groups,
         relation_state_groups=test_relation_states,
         relations=test_relations,
+    )
+    group_df["disagreement_metric"] = cfg.disagreement_metric
+    group_df["kernel_pair_mode"] = cfg.kernel_pair_mode
+    group_df["resolved_kernel_bandwidth"] = (
+        resolved_kernel_bandwidth if cfg.disagreement_metric == "kernel_mmd" else ""
     )
     group_df.to_csv(run_dir / "test_groups.csv", index=False, encoding="utf-8-sig")
 
@@ -860,6 +1166,97 @@ def main() -> int:
         encoding="utf-8-sig",
     )
 
+    infonce_model = None
+    infonce_valid = None
+    best_lambda_nce = None
+    infonce_grouped = None
+    infonce_reliability_grouped = None
+    infonce_relation_grouped = None
+    infonce_delta_df = pd.DataFrame()
+    infonce_reliability_delta_df = pd.DataFrame()
+    if cfg.run_infonce:
+        (
+            infonce_model,
+            infonce_valid,
+            best_lambda_nce,
+            infonce_sweep_rows,
+            infonce_grouped,
+            infonce_reliability_grouped,
+            infonce_lambda_delta_rows,
+            infonce_lambda_reliability_delta_rows,
+        ) = train_best_infonce(
+            input_dims,
+            loaders,
+            cfg,
+            device,
+            concat_grouped,
+            concat_reliability_grouped,
+            test_groups,
+            test_reliability_groups,
+        )
+        infonce_pred = predict(infonce_model, loaders["test"], device)
+        infonce_relation_grouped = grouped_metrics(
+            infonce_pred["y_true"],
+            infonce_pred["y_pred"],
+            test_relation_states,
+            group_order=RELATION_STATE_GROUP_ORDER,
+            include_overall=False,
+        )
+        pd.DataFrame(infonce_sweep_rows).to_csv(
+            run_dir / "infonce_lambda_sweep_valid.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        pd.DataFrame(infonce_lambda_delta_rows).to_csv(
+            run_dir / "infonce_lambda_test_delta_metrics.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        pd.DataFrame(infonce_lambda_reliability_delta_rows).to_csv(
+            run_dir / "infonce_lambda_high_d_reliability_delta.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        infonce_delta_rows = []
+        for group in ("Low-D", "Mid-D", "High-D", "Overall"):
+            infonce_delta_rows.append(
+                {
+                    "group": group,
+                    "delta_acc": infonce_grouped[group]["acc"] - concat_grouped[group]["acc"],
+                    "delta_macro_f1": infonce_grouped[group]["macro_f1"]
+                    - concat_grouped[group]["macro_f1"],
+                    "lambda_nce": best_lambda_nce,
+                    "nce_temperature": cfg.nce_temperature,
+                    "nce_pair_mode": cfg.nce_pair_mode,
+                }
+            )
+        infonce_delta_df = pd.DataFrame(infonce_delta_rows)
+        infonce_delta_df.to_csv(
+            run_dir / "infonce_delta_metrics.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        infonce_reliability_delta_rows = []
+        for group in HIGH_D_RELIABILITY_GROUP_ORDER:
+            infonce_reliability_delta_rows.append(
+                {
+                    "group": group,
+                    "delta_acc": infonce_reliability_grouped[group]["acc"]
+                    - concat_reliability_grouped[group]["acc"],
+                    "delta_macro_f1": infonce_reliability_grouped[group]["macro_f1"]
+                    - concat_reliability_grouped[group]["macro_f1"],
+                    "lambda_nce": best_lambda_nce,
+                    "nce_temperature": cfg.nce_temperature,
+                    "nce_pair_mode": cfg.nce_pair_mode,
+                }
+            )
+        infonce_reliability_delta_df = pd.DataFrame(infonce_reliability_delta_rows)
+        infonce_reliability_delta_df.to_csv(
+            run_dir / "infonce_high_d_reliability_delta.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+
     copa_model = None
     copa_valid = None
     best_lambda_copa = None
@@ -974,6 +1371,18 @@ def main() -> int:
     for row in direct_add_relation_rows:
         row["direct_add_alpha"] = best_direct_add_alpha
     relation_state_rows.extend(direct_add_relation_rows)
+    if cfg.run_infonce and infonce_relation_grouped is not None:
+        infonce_relation_rows = rows_for_method(
+            "UncondInfoNCE",
+            infonce_relation_grouped,
+            group_order=RELATION_STATE_GROUP_ORDER,
+            include_overall=False,
+        )
+        for row in infonce_relation_rows:
+            row["lambda_nce"] = best_lambda_nce
+            row["nce_temperature"] = cfg.nce_temperature
+            row["nce_pair_mode"] = cfg.nce_pair_mode
+        relation_state_rows.extend(infonce_relation_rows)
     if cfg.run_copa and copa_relation_grouped is not None:
         copa_relation_rows = rows_for_method(
             "CoPA",
@@ -1026,6 +1435,26 @@ def main() -> int:
         index=False,
         encoding="utf-8-sig",
     )
+    if cfg.run_infonce and infonce_relation_grouped is not None:
+        infonce_relation_state_delta_rows = []
+        for group in RELATION_STATE_GROUP_ORDER:
+            infonce_relation_state_delta_rows.append(
+                {
+                    "group": group,
+                    "delta_acc": infonce_relation_grouped[group]["acc"]
+                    - concat_relation_grouped[group]["acc"],
+                    "delta_macro_f1": infonce_relation_grouped[group]["macro_f1"]
+                    - concat_relation_grouped[group]["macro_f1"],
+                    "lambda_nce": best_lambda_nce,
+                    "nce_temperature": cfg.nce_temperature,
+                    "nce_pair_mode": cfg.nce_pair_mode,
+                }
+            )
+        pd.DataFrame(infonce_relation_state_delta_rows).to_csv(
+            run_dir / "infonce_relation_state_delta.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
     if cfg.run_copa and copa_relation_grouped is not None:
         copa_relation_state_delta_rows = []
         for group in RELATION_STATE_GROUP_ORDER:
@@ -1057,20 +1486,39 @@ def main() -> int:
                 "concat_macro_f1": concat_relation_grouped[group]["macro_f1"],
                 "uncond_align_macro_f1": align_relation_grouped[group]["macro_f1"],
                 "direct_add_macro_f1": direct_add_relation_grouped[group]["macro_f1"],
+                "infonce_macro_f1": (
+                    infonce_relation_grouped[group]["macro_f1"]
+                    if infonce_relation_grouped is not None
+                    else float("nan")
+                ),
                 "soft_split_probe_macro_f1": probe_row.get(
                     "common_residual_macro_f1",
+                    float("nan"),
+                ),
+                "text_anchor_probe_macro_f1": probe_row.get(
+                    "text_anchor_common_residual_macro_f1",
                     float("nan"),
                 ),
                 "residual_gain_macro_f1": probe_row.get(
                     "residual_gain_macro_f1",
                     float("nan"),
                 ),
+                "text_anchor_residual_gain_macro_f1": probe_row.get(
+                    "text_anchor_residual_gain_macro_f1",
+                    float("nan"),
+                ),
                 "shuffled_residual_only_macro_f1": probe_row.get(
                     "shuffled_residual_only_macro_f1",
                     float("nan"),
                 ),
+                "text_anchor_shuffled_residual_macro_f1": probe_row.get(
+                    "text_anchor_shuffled_residual_macro_f1",
+                    float("nan"),
+                ),
                 "lambda_align": best_lambda,
                 "direct_add_alpha": best_direct_add_alpha,
+                "lambda_nce": best_lambda_nce,
+                "nce_pair_mode": cfg.nce_pair_mode if cfg.run_infonce else "",
             }
         )
     concat_aware_df = pd.DataFrame(concat_aware_rows)
@@ -1087,6 +1535,13 @@ def main() -> int:
     for row in direct_add_rows:
         row["direct_add_alpha"] = best_direct_add_alpha
     rows.extend(direct_add_rows)
+    if cfg.run_infonce and infonce_grouped is not None:
+        infonce_rows = rows_for_method("UncondInfoNCE", infonce_grouped)
+        for row in infonce_rows:
+            row["lambda_nce"] = best_lambda_nce
+            row["nce_temperature"] = cfg.nce_temperature
+            row["nce_pair_mode"] = cfg.nce_pair_mode
+        rows.extend(infonce_rows)
     if cfg.run_copa and copa_grouped is not None:
         copa_rows = rows_for_method("CoPA", copa_grouped)
         for row in copa_rows:
@@ -1147,6 +1602,18 @@ def main() -> int:
             include_overall=False,
         )
     )
+    if cfg.run_infonce and infonce_reliability_grouped is not None:
+        infonce_reliability_rows = rows_for_method(
+            "UncondInfoNCE",
+            infonce_reliability_grouped,
+            group_order=HIGH_D_RELIABILITY_GROUP_ORDER,
+            include_overall=False,
+        )
+        for row in infonce_reliability_rows:
+            row["lambda_nce"] = best_lambda_nce
+            row["nce_temperature"] = cfg.nce_temperature
+            row["nce_pair_mode"] = cfg.nce_pair_mode
+        reliability_rows.extend(infonce_reliability_rows)
     if cfg.run_copa and copa_reliability_grouped is not None:
         copa_reliability_rows = rows_for_method(
             "CoPA",
@@ -1186,6 +1653,8 @@ def main() -> int:
     torch.save(concat_model.state_dict(), run_dir / "concat_model.pt")
     torch.save(align_model.state_dict(), run_dir / "uncond_align_model.pt")
     torch.save(direct_add_model.state_dict(), run_dir / "direct_add_model.pt")
+    if cfg.run_infonce and infonce_model is not None:
+        torch.save(infonce_model.state_dict(), run_dir / "infonce_model.pt")
     if cfg.run_copa and copa_model is not None:
         torch.save(copa_model.state_dict(), run_dir / "copa_model.pt")
     save_json(
@@ -1197,6 +1666,20 @@ def main() -> int:
             "best_lambda_align": best_lambda,
             "direct_add_valid": direct_add_valid,
             "best_direct_add_alpha": best_direct_add_alpha,
+            "infonce_valid": infonce_valid,
+            "best_lambda_nce": best_lambda_nce,
+            "nce_temperature": cfg.nce_temperature,
+            "nce_pair_mode": cfg.nce_pair_mode,
+            "disagreement_metric": cfg.disagreement_metric,
+            "kernel_bandwidth": cfg.kernel_bandwidth,
+            "kernel_pair_mode": cfg.kernel_pair_mode,
+            "kernel_class_weight": cfg.kernel_class_weight,
+            "kernel_max_class_samples": cfg.kernel_max_class_samples,
+            "resolved_kernel_bandwidth": resolved_kernel_bandwidth
+            if cfg.disagreement_metric == "kernel_mmd"
+            else None,
+            "copa_gate_metric": cfg.copa_gate_metric,
+            "copa_kernel_bandwidth": cfg.copa_kernel_bandwidth,
             "copa_valid": copa_valid,
             "best_lambda_copa": best_lambda_copa,
             "thresholds": {"q33": q33, "q66": q66, "q_r": q_r},
@@ -1217,6 +1700,11 @@ def main() -> int:
     print(delta_df.to_string(index=False))
     print("\nDirectAdd delta metrics:")
     print(direct_add_delta_df.to_string(index=False))
+    if cfg.run_infonce:
+        print("\nInfoNCE delta metrics:")
+        print(infonce_delta_df.to_string(index=False))
+        print("\nInfoNCE High-D reliability delta metrics:")
+        print(infonce_reliability_delta_df.to_string(index=False))
     print("\nHigh-D reliability delta metrics:")
     print(reliability_delta_df.to_string(index=False))
     print("\nRelation-state delta metrics:")

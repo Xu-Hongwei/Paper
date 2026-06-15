@@ -48,20 +48,211 @@ def pairwise_disagreement(
     }
 
 
+def _l2_normalize(features: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    norm = np.linalg.norm(features, axis=-1, keepdims=True)
+    return features / np.maximum(norm, eps)
+
+
+def _parse_bandwidth(bandwidth: str | float) -> float | str:
+    if isinstance(bandwidth, str):
+        if bandwidth == "median":
+            return bandwidth
+        return float(bandwidth)
+    return float(bandwidth)
+
+
+def _median_bandwidth(
+    arrays: tuple[np.ndarray, ...],
+    *,
+    max_samples: int = 2048,
+    seed: int = 0,
+) -> float:
+    features = np.concatenate([_l2_normalize(array) for array in arrays], axis=0)
+    if features.shape[0] > max_samples:
+        rng = np.random.default_rng(seed)
+        sample = rng.choice(features.shape[0], size=max_samples, replace=False)
+        features = features[sample]
+    squared = np.sum((features[:, None, :] - features[None, :, :]) ** 2, axis=-1)
+    distances = np.sqrt(squared[np.triu_indices(features.shape[0], k=1)])
+    distances = distances[distances > 0]
+    if distances.size == 0:
+        return 1.0
+    return float(np.median(distances))
+
+
+def _resolve_bandwidth(
+    arrays: tuple[np.ndarray, ...],
+    bandwidth: str | float,
+    *,
+    seed: int = 0,
+) -> float:
+    parsed = _parse_bandwidth(bandwidth)
+    if parsed == "median":
+        return _median_bandwidth(arrays, seed=seed)
+    if parsed <= 0:
+        raise ValueError("kernel bandwidth must be positive.")
+    return float(parsed)
+
+
+def resolve_kernel_bandwidth(
+    h_t: np.ndarray,
+    h_v: np.ndarray,
+    h_a: np.ndarray,
+    bandwidth: str | float = "median",
+    *,
+    seed: int = 0,
+) -> float:
+    return _resolve_bandwidth((h_t, h_v, h_a), bandwidth, seed=seed)
+
+
+def _rbf_kernel(left: np.ndarray, right: np.ndarray, bandwidth: float) -> np.ndarray:
+    left = _l2_normalize(left)
+    right = _l2_normalize(right)
+    squared = np.sum((left[:, None, :] - right[None, :, :]) ** 2, axis=-1)
+    return np.exp(-squared / (2.0 * bandwidth * bandwidth))
+
+
+def _rbf_point_disagreement(
+    left: np.ndarray,
+    right: np.ndarray,
+    bandwidth: float,
+) -> np.ndarray:
+    left = _l2_normalize(left)
+    right = _l2_normalize(right)
+    squared = np.sum((left - right) ** 2, axis=-1)
+    return 1.0 - np.exp(-squared / (2.0 * bandwidth * bandwidth))
+
+
+def _class_conditional_mmd(
+    left: np.ndarray,
+    right: np.ndarray,
+    pred_labels: np.ndarray,
+    bandwidth: float,
+    *,
+    max_class_samples: int = 1024,
+    seed: int = 0,
+) -> np.ndarray:
+    pred_labels = np.asarray(pred_labels).reshape(-1)
+    if pred_labels.shape[0] != left.shape[0]:
+        raise ValueError("pred_labels must have the same sample count as features.")
+    result = np.zeros(left.shape[0], dtype=np.float64)
+    rng = np.random.default_rng(seed)
+    for label in np.unique(pred_labels):
+        indices = np.where(pred_labels == label)[0]
+        if indices.size == 0:
+            continue
+        used = indices
+        if used.size > max_class_samples:
+            used = rng.choice(used, size=max_class_samples, replace=False)
+        k_xx = _rbf_kernel(left[used], left[used], bandwidth).mean()
+        k_yy = _rbf_kernel(right[used], right[used], bandwidth).mean()
+        k_xy = _rbf_kernel(left[used], right[used], bandwidth).mean()
+        result[indices] = max(0.0, float(k_xx + k_yy - 2.0 * k_xy))
+    return result
+
+
+def _kernel_disagreement_pair(
+    left: np.ndarray,
+    right: np.ndarray,
+    pred_labels: np.ndarray,
+    bandwidth: float,
+    *,
+    class_weight: float = 0.5,
+    max_class_samples: int = 1024,
+    seed: int = 0,
+) -> np.ndarray:
+    if not 0.0 <= class_weight <= 1.0:
+        raise ValueError("class_weight must be in [0, 1].")
+    point = _rbf_point_disagreement(left, right, bandwidth)
+    if class_weight == 0.0:
+        return point
+    class_mmd = _class_conditional_mmd(
+        left,
+        right,
+        pred_labels,
+        bandwidth,
+        max_class_samples=max_class_samples,
+        seed=seed,
+    )
+    return (1.0 - class_weight) * point + class_weight * class_mmd
+
+
+def kernel_pairwise_disagreement(
+    h_t: np.ndarray,
+    h_v: np.ndarray,
+    h_a: np.ndarray,
+    pred_labels: np.ndarray,
+    *,
+    bandwidth: str | float = "median",
+    class_weight: float = 0.5,
+    max_class_samples: int = 1024,
+    seed: int = 0,
+) -> dict[str, np.ndarray]:
+    resolved = _resolve_bandwidth((h_t, h_v, h_a), bandwidth, seed=seed)
+    return {
+        "D_tv": _kernel_disagreement_pair(
+            h_t,
+            h_v,
+            pred_labels,
+            resolved,
+            class_weight=class_weight,
+            max_class_samples=max_class_samples,
+            seed=seed + 1,
+        ),
+        "D_ta": _kernel_disagreement_pair(
+            h_t,
+            h_a,
+            pred_labels,
+            resolved,
+            class_weight=class_weight,
+            max_class_samples=max_class_samples,
+            seed=seed + 2,
+        ),
+        "D_va": _kernel_disagreement_pair(
+            h_v,
+            h_a,
+            pred_labels,
+            resolved,
+            class_weight=class_weight,
+            max_class_samples=max_class_samples,
+            seed=seed + 3,
+        ),
+    }
+
+
+def sample_disagreement_from_pairwise(
+    distances: dict[str, np.ndarray],
+    *,
+    pair_mode: str = "full_pair",
+) -> np.ndarray:
+    if pair_mode == "text_anchor":
+        return (distances["D_tv"] + distances["D_ta"]) / 2.0
+    if pair_mode == "full_pair":
+        return (distances["D_tv"] + distances["D_ta"] + distances["D_va"]) / 3.0
+    raise ValueError("pair_mode must be 'text_anchor' or 'full_pair'.")
+
+
+def agreement_from_distances(
+    distances: dict[str, np.ndarray],
+    tau_agreement: float,
+) -> dict[str, np.ndarray]:
+    if tau_agreement <= 0:
+        raise ValueError("tau_agreement must be positive.")
+    return {
+        "A_tv": np.exp(-distances["D_tv"] / tau_agreement),
+        "A_ta": np.exp(-distances["D_ta"] / tau_agreement),
+        "A_va": np.exp(-distances["D_va"] / tau_agreement),
+    }
+
+
 def pairwise_agreement(
     prob_t: np.ndarray,
     prob_v: np.ndarray,
     prob_a: np.ndarray,
     tau_agreement: float,
 ) -> dict[str, np.ndarray]:
-    if tau_agreement <= 0:
-        raise ValueError("tau_agreement must be positive.")
     distances = pairwise_disagreement(prob_t, prob_v, prob_a)
-    return {
-        "A_tv": np.exp(-distances["D_tv"] / tau_agreement),
-        "A_ta": np.exp(-distances["D_ta"] / tau_agreement),
-        "A_va": np.exp(-distances["D_va"] / tau_agreement),
-    }
+    return agreement_from_distances(distances, tau_agreement)
 
 
 def normalized_reliability(prob: np.ndarray, eps: float = 1e-8) -> np.ndarray:
@@ -134,8 +325,13 @@ def relation_gates(
     tau_agreement: float,
     *,
     prefix: str = "",
+    distances: dict[str, np.ndarray] | None = None,
 ) -> dict[str, np.ndarray]:
-    agreements = pairwise_agreement(prob_t, prob_v, prob_a, tau_agreement)
+    agreements = (
+        pairwise_agreement(prob_t, prob_v, prob_a, tau_agreement)
+        if distances is None
+        else agreement_from_distances(distances, tau_agreement)
+    )
     r_text = reliability[f"{prefix}text"]
     r_vision = reliability[f"{prefix}vision"]
     r_audio = reliability[f"{prefix}audio"]
@@ -164,8 +360,14 @@ def label_aware_relation_gates(
     prob_a: np.ndarray,
     reliability: dict[str, np.ndarray],
     tau_agreement: float,
+    *,
+    distances: dict[str, np.ndarray] | None = None,
 ) -> dict[str, np.ndarray]:
-    agreements = pairwise_agreement(prob_t, prob_v, prob_a, tau_agreement)
+    agreements = (
+        pairwise_agreement(prob_t, prob_v, prob_a, tau_agreement)
+        if distances is None
+        else agreement_from_distances(distances, tau_agreement)
+    )
     c_text = reliability["C_text"]
     c_vision = reliability["C_vision"]
     c_audio = reliability["C_audio"]
@@ -204,6 +406,13 @@ def label_aware_relation_gates(
 def build_label_aware_relation_frame(
     pred: dict[str, np.ndarray],
     tau_agreement: float,
+    *,
+    disagreement_metric: str = "prob_jsd",
+    kernel_bandwidth: str | float = "median",
+    kernel_pair_mode: str = "text_anchor",
+    kernel_class_weight: float = 0.5,
+    kernel_max_class_samples: int = 1024,
+    seed: int = 0,
 ) -> pd.DataFrame:
     reliability = label_aware_reliability(
         pred["prob_t"],
@@ -211,12 +420,28 @@ def build_label_aware_relation_frame(
         pred["prob_a"],
         pred["y_true"],
     )
+    if disagreement_metric == "prob_jsd":
+        distances = pairwise_disagreement(pred["prob_t"], pred["prob_v"], pred["prob_a"])
+    elif disagreement_metric == "kernel_mmd":
+        distances = kernel_pairwise_disagreement(
+            pred["h_t"],
+            pred["h_v"],
+            pred["h_a"],
+            pred["y_pred"],
+            bandwidth=kernel_bandwidth,
+            class_weight=kernel_class_weight,
+            max_class_samples=kernel_max_class_samples,
+            seed=seed,
+        )
+    else:
+        raise ValueError("disagreement_metric must be 'prob_jsd' or 'kernel_mmd'.")
     gates = label_aware_relation_gates(
         pred["prob_t"],
         pred["prob_v"],
         pred["prob_a"],
         reliability,
         tau_agreement,
+        distances=distances,
     )
     return pd.DataFrame(
         {
@@ -225,8 +450,10 @@ def build_label_aware_relation_frame(
             "label_cls": pred["y_true"],
             "prediction": pred["y_pred"],
             **reliability,
-            **pairwise_disagreement(pred["prob_t"], pred["prob_v"], pred["prob_a"]),
+            **distances,
             **gates,
+            "disagreement_metric": disagreement_metric,
+            "kernel_pair_mode": kernel_pair_mode,
         }
     )
 

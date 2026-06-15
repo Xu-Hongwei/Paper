@@ -10,7 +10,12 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from .metrics import classification_metrics
-from .model import MultimodalClassifier, label_aware_copa_loss, unconditional_alignment_loss
+from .model import (
+    MultimodalClassifier,
+    label_aware_copa_loss,
+    unconditional_alignment_loss,
+    unconditional_infonce_loss,
+)
 
 
 def move_batch(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
@@ -22,12 +27,18 @@ def compute_loss(
     labels: torch.Tensor,
     eta_unimodal: float = 0.0,
     lambda_align: float = 0.0,
+    lambda_nce: float = 0.0,
+    nce_temperature: float = 0.1,
+    nce_pair_mode: str = "text_anchor",
     lambda_copa: float = 0.0,
     tau_agreement: float = 0.1,
     copa_proto_weight: float = 1.0,
     copa_agr_weight: float = 1.0,
     copa_comp_weight: float = 0.5,
     copa_comp_margin: float = 0.2,
+    copa_orth_weight: float = 0.01,
+    copa_gate_metric: str = "prob_jsd",
+    copa_kernel_bandwidth: str | float = "median",
 ) -> torch.Tensor:
     loss = F.cross_entropy(outputs["logits_f"], labels)
     if eta_unimodal > 0:
@@ -38,6 +49,12 @@ def compute_loss(
         )
     if lambda_align > 0:
         loss = loss + lambda_align * unconditional_alignment_loss(outputs)
+    if lambda_nce > 0:
+        loss = loss + lambda_nce * unconditional_infonce_loss(
+            outputs,
+            temperature=nce_temperature,
+            pair_mode=nce_pair_mode,
+        )
     if lambda_copa > 0:
         copa_loss, _ = label_aware_copa_loss(
             outputs,
@@ -47,6 +64,9 @@ def compute_loss(
             agr_weight=copa_agr_weight,
             comp_weight=copa_comp_weight,
             comp_margin=copa_comp_margin,
+            orth_weight=copa_orth_weight,
+            gate_metric=copa_gate_metric,
+            kernel_bandwidth=copa_kernel_bandwidth,
         )
         loss = loss + lambda_copa * copa_loss
     return loss
@@ -122,12 +142,18 @@ def train_model(
     weight_decay: float,
     eta_unimodal: float = 0.0,
     lambda_align: float = 0.0,
+    lambda_nce: float = 0.0,
+    nce_temperature: float = 0.1,
+    nce_pair_mode: str = "text_anchor",
     lambda_copa: float = 0.0,
     tau_agreement: float = 0.1,
     copa_proto_weight: float = 1.0,
     copa_agr_weight: float = 1.0,
     copa_comp_weight: float = 0.5,
     copa_comp_margin: float = 0.2,
+    copa_orth_weight: float = 0.01,
+    copa_gate_metric: str = "prob_jsd",
+    copa_kernel_bandwidth: str | float = "median",
     patience: int = 8,
     desc: str = "train",
     show_progress: bool = True,
@@ -155,12 +181,18 @@ def train_model(
                 labels,
                 eta_unimodal=eta_unimodal,
                 lambda_align=lambda_align,
+                lambda_nce=lambda_nce,
+                nce_temperature=nce_temperature,
+                nce_pair_mode=nce_pair_mode,
                 lambda_copa=lambda_copa,
                 tau_agreement=tau_agreement,
                 copa_proto_weight=copa_proto_weight,
                 copa_agr_weight=copa_agr_weight,
                 copa_comp_weight=copa_comp_weight,
                 copa_comp_margin=copa_comp_margin,
+                copa_orth_weight=copa_orth_weight,
+                copa_gate_metric=copa_gate_metric,
+                copa_kernel_bandwidth=copa_kernel_bandwidth,
             )
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
