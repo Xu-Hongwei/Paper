@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import subprocess
 import sys
 from datetime import datetime
@@ -13,8 +14,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.config import DATASETS  # noqa: E402
+from src.disagreement import HIGH_D_RELIABILITY_GROUP_ORDER, RELATION_STATE_GROUP_ORDER  # noqa: E402
 from src.plotting import (  # noqa: E402
+    save_detailed_delta_plot,
     save_lambda_curve_plot,
+    save_method_relation_state_heatmap,
     save_multi_seed_delta_plot,
     save_reliability_delta_plot,
 )
@@ -69,6 +73,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--copa_comp_margin", type=float, default=0.2)
     parser.add_argument("--patience", type=int, default=8)
     parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Pass deterministic seeding controls to each single-seed run.",
+    )
+    parser.add_argument(
+        "--error_min_seeds",
+        type=int,
+        default=5,
+        help="Minimum seed count required before a delta passes error control.",
+    )
+    parser.add_argument(
+        "--error_sign_rate",
+        type=float,
+        default=0.8,
+        help="Required same-sign seed ratio for delta error-control checks.",
+    )
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Pass --quiet to each single-seed run.",
@@ -87,10 +108,136 @@ def newest_run_dir(run_root: Path, dataset: str, seen: set[Path]) -> Path:
     return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
-def flatten_summary(frame: pd.DataFrame, group_cols: list[str], value_cols: list[str]) -> pd.DataFrame:
-    summary = frame.groupby(group_cols, dropna=False)[value_cols].agg(["mean", "std", "count"])
-    summary.columns = [f"{value}_{stat}" for value, stat in summary.columns]
-    return summary.reset_index()
+def t_critical_95(count: int) -> float:
+    table = {
+        1: math.nan,
+        2: 12.706,
+        3: 4.303,
+        4: 3.182,
+        5: 2.776,
+        6: 2.571,
+        7: 2.447,
+        8: 2.365,
+        9: 2.306,
+        10: 2.262,
+        11: 2.228,
+        12: 2.201,
+        13: 2.179,
+        14: 2.160,
+        15: 2.145,
+        16: 2.131,
+        17: 2.120,
+        18: 2.110,
+        19: 2.101,
+        20: 2.093,
+        21: 2.086,
+        22: 2.080,
+        23: 2.074,
+        24: 2.069,
+        25: 2.064,
+        26: 2.060,
+        27: 2.056,
+        28: 2.052,
+        29: 2.048,
+        30: 2.045,
+    }
+    if count <= 30:
+        return table.get(count, math.nan)
+    return 1.96
+
+
+def flatten_summary(
+    frame: pd.DataFrame,
+    group_cols: list[str],
+    value_cols: list[str],
+    *,
+    sign_cols: list[str] | None = None,
+    min_count: int = 5,
+    sign_rate_threshold: float = 0.8,
+) -> pd.DataFrame:
+    sign_cols = sign_cols or []
+    rows: list[dict[str, object]] = []
+    grouped = frame.groupby(group_cols, dropna=False, sort=True)
+    for key, group in grouped:
+        keys = key if isinstance(key, tuple) else (key,)
+        row: dict[str, object] = dict(zip(group_cols, keys))
+        for value in value_cols:
+            series = pd.to_numeric(group[value], errors="coerce").dropna()
+            count = int(series.shape[0])
+            mean = float(series.mean()) if count else math.nan
+            std = float(series.std(ddof=1)) if count > 1 else math.nan
+            sem = std / math.sqrt(count) if count > 1 else math.nan
+            critical = t_critical_95(count)
+            margin = critical * sem if count > 1 and not math.isnan(critical) else math.nan
+            row[f"{value}_mean"] = mean
+            row[f"{value}_std"] = std
+            row[f"{value}_count"] = count
+            row[f"{value}_sem"] = sem
+            row[f"{value}_ci95_low"] = mean - margin if not math.isnan(margin) else math.nan
+            row[f"{value}_ci95_high"] = mean + margin if not math.isnan(margin) else math.nan
+            if value in sign_cols:
+                positive_rate = float((series > 0).mean()) if count else math.nan
+                negative_rate = float((series < 0).mean()) if count else math.nan
+                zero_rate = float((series == 0).mean()) if count else math.nan
+                sign_consistency = (
+                    max(positive_rate, negative_rate)
+                    if not math.isnan(positive_rate) and not math.isnan(negative_rate)
+                    else math.nan
+                )
+                ci_low = row[f"{value}_ci95_low"]
+                ci_high = row[f"{value}_ci95_high"]
+                ci_excludes_zero = (
+                    isinstance(ci_low, float)
+                    and isinstance(ci_high, float)
+                    and not math.isnan(ci_low)
+                    and not math.isnan(ci_high)
+                    and (ci_low > 0 or ci_high < 0)
+                )
+                row[f"{value}_positive_rate"] = positive_rate
+                row[f"{value}_negative_rate"] = negative_rate
+                row[f"{value}_zero_rate"] = zero_rate
+                row[f"{value}_sign_consistency"] = sign_consistency
+                row[f"{value}_ci95_excludes_zero"] = ci_excludes_zero
+                row[f"{value}_passes_error_control"] = bool(
+                    count >= min_count
+                    and sign_consistency >= sign_rate_threshold
+                    and ci_excludes_zero
+                )
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def write_error_control_report(
+    path: Path,
+    frames: list[tuple[str, pd.DataFrame, list[str]]],
+) -> None:
+    rows: list[dict[str, object]] = []
+    for source, frame, key_cols in frames:
+        for _, record in frame.iterrows():
+            key = ",".join(f"{column}={record[column]}" for column in key_cols)
+            for metric in ("delta_acc", "delta_macro_f1"):
+                pass_col = f"{metric}_passes_error_control"
+                if pass_col not in frame.columns:
+                    continue
+                rows.append(
+                    {
+                        "source": source,
+                        "key": key,
+                        "metric": metric,
+                        "mean": record.get(f"{metric}_mean"),
+                        "std": record.get(f"{metric}_std"),
+                        "sem": record.get(f"{metric}_sem"),
+                        "ci95_low": record.get(f"{metric}_ci95_low"),
+                        "ci95_high": record.get(f"{metric}_ci95_high"),
+                        "count": record.get(f"{metric}_count"),
+                        "positive_rate": record.get(f"{metric}_positive_rate"),
+                        "negative_rate": record.get(f"{metric}_negative_rate"),
+                        "sign_consistency": record.get(f"{metric}_sign_consistency"),
+                        "ci95_excludes_zero": record.get(f"{metric}_ci95_excludes_zero"),
+                        "passes_error_control": record.get(pass_col),
+                    }
+                )
+    pd.DataFrame(rows).to_csv(path, index=False, encoding="utf-8-sig")
 
 
 def read_seed_csv(run_dirs: list[tuple[int, Path]], filename: str) -> pd.DataFrame:
@@ -164,6 +311,8 @@ def run_one_seed(args: argparse.Namespace, run_root: Path, seed: int, seen: set[
         "--direct_add_alpha_values",
         *[str(value) for value in args.direct_add_alpha_values],
     ]
+    if args.deterministic:
+        command.append("--deterministic")
     if args.run_copa:
         command.extend(
             [
@@ -223,6 +372,9 @@ def main() -> int:
             "copa_comp_weight": args.copa_comp_weight,
             "copa_comp_margin": args.copa_comp_margin,
             "patience": args.patience,
+            "deterministic": args.deterministic,
+            "error_min_seeds": args.error_min_seeds,
+            "error_sign_rate": args.error_sign_rate,
             "quiet": args.quiet,
         },
     )
@@ -397,6 +549,9 @@ def main() -> int:
         delta_all,
         ["group"],
         ["delta_acc", "delta_macro_f1", "lambda_align"],
+        sign_cols=["delta_acc", "delta_macro_f1"],
+        min_count=args.error_min_seeds,
+        sign_rate_threshold=args.error_sign_rate,
     )
     group_summary = flatten_summary(
         group_all,
@@ -407,21 +562,33 @@ def main() -> int:
         direct_add_delta_all,
         ["group"],
         ["delta_acc", "delta_macro_f1", "direct_add_alpha"],
+        sign_cols=["delta_acc", "delta_macro_f1"],
+        min_count=args.error_min_seeds,
+        sign_rate_threshold=args.error_sign_rate,
     )
     direct_add_alpha_delta_summary = flatten_summary(
         direct_add_alpha_delta_all,
         ["direct_add_alpha", "group"],
         ["delta_acc", "delta_macro_f1", "valid_macro_f1", "valid_acc"],
+        sign_cols=["delta_acc", "delta_macro_f1"],
+        min_count=args.error_min_seeds,
+        sign_rate_threshold=args.error_sign_rate,
     )
     reliability_summary = flatten_summary(
         reliability_delta_all,
         ["group"],
         ["delta_acc", "delta_macro_f1", "lambda_align"],
+        sign_cols=["delta_acc", "delta_macro_f1"],
+        min_count=args.error_min_seeds,
+        sign_rate_threshold=args.error_sign_rate,
     )
     relation_state_summary = flatten_summary(
         relation_state_delta_all,
         ["group"],
         ["delta_acc", "delta_macro_f1", "lambda_align"],
+        sign_cols=["delta_acc", "delta_macro_f1"],
+        min_count=args.error_min_seeds,
+        sign_rate_threshold=args.error_sign_rate,
     )
     relation_state_metrics_summary = flatten_summary(
         relation_state_metrics_all,
@@ -432,6 +599,9 @@ def main() -> int:
         direct_add_relation_state_delta_all,
         ["group"],
         ["delta_acc", "delta_macro_f1", "direct_add_alpha"],
+        sign_cols=["delta_acc", "delta_macro_f1"],
+        min_count=args.error_min_seeds,
+        sign_rate_threshold=args.error_sign_rate,
     )
     concat_aware_summary = flatten_summary(
         concat_aware_all,
@@ -485,11 +655,17 @@ def main() -> int:
         lambda_delta_all,
         ["lambda_align", "group"],
         ["delta_acc", "delta_macro_f1", "valid_macro_f1", "valid_acc"],
+        sign_cols=["delta_acc", "delta_macro_f1"],
+        min_count=args.error_min_seeds,
+        sign_rate_threshold=args.error_sign_rate,
     )
     lambda_reliability_summary = flatten_summary(
         lambda_reliability_delta_all,
         ["lambda_align", "group"],
         ["delta_acc", "delta_macro_f1", "valid_macro_f1", "valid_acc"],
+        sign_cols=["delta_acc", "delta_macro_f1"],
+        min_count=args.error_min_seeds,
+        sign_rate_threshold=args.error_sign_rate,
     )
     relation_value_cols = [
         column
@@ -511,26 +687,41 @@ def main() -> int:
             copa_delta_all,
             ["group"],
             ["delta_acc", "delta_macro_f1", "lambda_copa"],
+            sign_cols=["delta_acc", "delta_macro_f1"],
+            min_count=args.error_min_seeds,
+            sign_rate_threshold=args.error_sign_rate,
         )
         copa_reliability_summary = flatten_summary(
             copa_reliability_delta_all,
             ["group"],
             ["delta_acc", "delta_macro_f1", "lambda_copa"],
+            sign_cols=["delta_acc", "delta_macro_f1"],
+            min_count=args.error_min_seeds,
+            sign_rate_threshold=args.error_sign_rate,
         )
         copa_relation_state_summary = flatten_summary(
             copa_relation_state_delta_all,
             ["group"],
             ["delta_acc", "delta_macro_f1", "lambda_copa"],
+            sign_cols=["delta_acc", "delta_macro_f1"],
+            min_count=args.error_min_seeds,
+            sign_rate_threshold=args.error_sign_rate,
         )
         copa_lambda_delta_summary = flatten_summary(
             copa_lambda_delta_all,
             ["lambda_copa", "group"],
             ["delta_acc", "delta_macro_f1", "valid_macro_f1", "valid_acc"],
+            sign_cols=["delta_acc", "delta_macro_f1"],
+            min_count=args.error_min_seeds,
+            sign_rate_threshold=args.error_sign_rate,
         )
         copa_lambda_reliability_summary = flatten_summary(
             copa_lambda_reliability_delta_all,
             ["lambda_copa", "group"],
             ["delta_acc", "delta_macro_f1", "valid_macro_f1", "valid_acc"],
+            sign_cols=["delta_acc", "delta_macro_f1"],
+            min_count=args.error_min_seeds,
+            sign_rate_threshold=args.error_sign_rate,
         )
 
     delta_summary.to_csv(
@@ -640,25 +831,119 @@ def main() -> int:
             encoding="utf-8-sig",
         )
 
+    error_frames: list[tuple[str, pd.DataFrame, list[str]]] = [
+        ("uncond_align_delta", delta_summary, ["group"]),
+        ("uncond_align_high_d_reliability", reliability_summary, ["group"]),
+        ("uncond_align_relation_state", relation_state_summary, ["group"]),
+        ("direct_add_delta", direct_add_delta_summary, ["group"]),
+        ("direct_add_relation_state", direct_add_relation_state_summary, ["group"]),
+        ("lambda_align_strength", lambda_delta_summary, ["lambda_align", "group"]),
+        (
+            "lambda_align_high_d_reliability",
+            lambda_reliability_summary,
+            ["lambda_align", "group"],
+        ),
+    ]
+    if args.run_copa:
+        error_frames.extend(
+            [
+                ("copa_delta", copa_delta_summary, ["group"]),
+                ("copa_high_d_reliability", copa_reliability_summary, ["group"]),
+                ("copa_relation_state", copa_relation_state_summary, ["group"]),
+                ("lambda_copa_strength", copa_lambda_delta_summary, ["lambda_copa", "group"]),
+                (
+                    "lambda_copa_high_d_reliability",
+                    copa_lambda_reliability_summary,
+                    ["lambda_copa", "group"],
+                ),
+            ]
+        )
+    write_error_control_report(summary_dir / "error_control_report.csv", error_frames)
+
     save_multi_seed_delta_plot(delta_summary, summary_dir / "multi_seed_delta_macro_f1.png")
+    save_detailed_delta_plot(
+        delta_all,
+        delta_summary,
+        summary_dir / "multi_seed_delta_macro_f1_detailed.png",
+        title="Unconditional alignment gain by disagreement group",
+        ylabel="Delta Macro-F1 (UncondAlign - Concat)",
+    )
     save_reliability_delta_plot(
         reliability_summary,
         summary_dir / "high_d_reliability_delta.png",
+    )
+    save_detailed_delta_plot(
+        reliability_delta_all,
+        reliability_summary,
+        summary_dir / "high_d_reliability_delta_detailed.png",
+        group_order=HIGH_D_RELIABILITY_GROUP_ORDER,
+        title="Unconditional alignment on High-D reliability split",
+        ylabel="Delta Macro-F1 (UncondAlign - Concat)",
+    )
+    save_detailed_delta_plot(
+        relation_state_delta_all,
+        relation_state_summary,
+        summary_dir / "relation_state_delta_detailed.png",
+        group_order=RELATION_STATE_GROUP_ORDER,
+        title="Unconditional alignment by relation state",
+        ylabel="Delta Macro-F1 (UncondAlign - Concat)",
+    )
+    save_detailed_delta_plot(
+        direct_add_relation_state_delta_all,
+        direct_add_relation_state_summary,
+        summary_dir / "direct_add_relation_state_delta_detailed.png",
+        group_order=RELATION_STATE_GROUP_ORDER,
+        title="DirectAdd by relation state",
+        ylabel="Delta Macro-F1 (DirectAdd - Concat)",
     )
     save_lambda_curve_plot(
         lambda_delta_summary,
         summary_dir / "lambda_delta_macro_f1_curve.png",
         title="Multi-seed lambda alignment strength curve",
+        raw_frame=lambda_delta_all,
     )
+    heatmap_summaries = {
+        "UncondAlign": relation_state_summary,
+        "DirectAdd": direct_add_relation_state_summary,
+    }
     if args.run_copa:
-        copa_curve_df = copa_lambda_delta_summary.rename(
-            columns={"lambda_copa": "lambda_align"}
+        save_detailed_delta_plot(
+            copa_delta_all,
+            copa_delta_summary,
+            summary_dir / "copa_delta_macro_f1_detailed.png",
+            title="CoPA gain by disagreement group",
+            ylabel="Delta Macro-F1 (CoPA - Concat)",
         )
+        save_detailed_delta_plot(
+            copa_reliability_delta_all,
+            copa_reliability_summary,
+            summary_dir / "copa_high_d_reliability_delta_detailed.png",
+            group_order=HIGH_D_RELIABILITY_GROUP_ORDER,
+            title="CoPA on High-D reliability split",
+            ylabel="Delta Macro-F1 (CoPA - Concat)",
+        )
+        save_detailed_delta_plot(
+            copa_relation_state_delta_all,
+            copa_relation_state_summary,
+            summary_dir / "copa_relation_state_delta_detailed.png",
+            group_order=RELATION_STATE_GROUP_ORDER,
+            title="CoPA by relation state",
+            ylabel="Delta Macro-F1 (CoPA - Concat)",
+        )
+        heatmap_summaries["CoPA"] = copa_relation_state_summary
         save_lambda_curve_plot(
-            copa_curve_df,
+            copa_lambda_delta_summary,
             summary_dir / "copa_lambda_delta_macro_f1_curve.png",
             title="Multi-seed CoPA strength curve",
+            x_col="lambda_copa",
+            x_label="lambda_copa",
+            y_label="Delta Macro-F1 (CoPA - Concat)",
+            raw_frame=copa_lambda_delta_all,
         )
+    save_method_relation_state_heatmap(
+        heatmap_summaries,
+        summary_dir / "relation_state_method_comparison_heatmap.png",
+    )
     write_conclusion(delta_summary, summary_dir / "experiment_one_conclusion.json")
 
     print("\nMulti-seed delta summary:")

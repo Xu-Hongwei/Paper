@@ -91,6 +91,17 @@ python -B code\disagreement_phenomenon\scripts\run_multi_seed.py --dataset mosei
 Avoid `--num_workers 2` on Windows for the large MOSEI arrays unless you have
 verified it locally. It can fail with PyTorch shared-event errors.
 
+For lower run-to-run implementation variance, add deterministic seeding:
+
+```powershell
+python -B code\disagreement_phenomenon\scripts\run_multi_seed.py --dataset mosei --data_root E:\Xu\data\MultiBench --seeds 1 2 3 4 5 --batch_size 1024 --num_workers 0 --epochs 25 --patience 6 --quiet --run_copa --deterministic
+```
+
+This fixes Python/NumPy/PyTorch seeds, uses a seeded DataLoader generator, and
+enables deterministic PyTorch algorithms with warnings instead of hard failure.
+It reduces implementation noise, but it does not remove true seed sensitivity
+from model initialization and training.
+
 ## Methods
 
 ### Concat
@@ -118,6 +129,46 @@ L = L_task + lambda_align * L_align
 The best model is selected by validation overall Macro-F1. The script also
 exports the full lambda curve on test groups so the alignment strength effect
 can be inspected directly.
+
+### Error Control
+
+Multi-seed summaries now report uncertainty columns in addition to
+`mean/std/count`:
+
+```text
+*_sem
+*_ci95_low
+*_ci95_high
+*_positive_rate
+*_negative_rate
+*_sign_consistency
+*_ci95_excludes_zero
+*_passes_error_control
+```
+
+For delta metrics, `passes_error_control` is conservative. It is true only
+when:
+
+```text
+seed count >= --error_min_seeds
+same-sign seed ratio >= --error_sign_rate
+95% CI does not cross zero
+```
+
+Defaults are:
+
+```text
+--error_min_seeds 5
+--error_sign_rate 0.8
+```
+
+With only two seeds, most rows should remain `passes_error_control=false`; that
+means the trend is preliminary rather than invalid. The compact overview is
+written to:
+
+```text
+error_control_report.csv
+```
 
 ### Direct Addition Alignment
 
@@ -374,8 +425,14 @@ Key multi-seed outputs:
 
 ```text
 multi_seed_delta_summary.csv
+error_control_report.csv
 lambda_test_delta_summary.csv
 lambda_delta_macro_f1_curve.png
+multi_seed_delta_macro_f1_detailed.png
+high_d_reliability_delta_detailed.png
+relation_state_delta_detailed.png
+direct_add_relation_state_delta_detailed.png
+relation_state_method_comparison_heatmap.png
 label_aware_relation_multi_seed_summary.csv
 relation_state_delta_summary.csv
 relation_state_metrics_summary.csv
@@ -405,8 +462,26 @@ Additional multi-seed CoPA outputs when `--run_copa` is used:
 copa_delta_summary.csv
 copa_lambda_test_delta_summary.csv
 copa_lambda_delta_macro_f1_curve.png
+copa_delta_macro_f1_detailed.png
+copa_high_d_reliability_delta_detailed.png
+copa_relation_state_delta_detailed.png
 copa_relation_state_delta_summary.csv
 ```
+
+Detailed plots use the same visual grammar:
+
+```text
+bar height          = multi-seed mean delta
+error bar           = 95% confidence interval when available
+black dots          = individual seed results
+n                   = valid seed count for that group
++80% / -80%         = same-sign seed ratio
+EC                  = passes the configured error-control rule
+```
+
+`relation_state_method_comparison_heatmap.png` compares UncondAlign,
+DirectAdd, and CoPA across RA/UA/Mid-D/RD/ND. Each cell reports the mean
+delta, 95% CI, sign consistency, and `*` when the row passes error control.
 
 ## Smoke Test
 

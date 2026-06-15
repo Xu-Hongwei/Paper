@@ -6,6 +6,7 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -138,14 +139,40 @@ def main() -> int:
             "copa_lambda_high_d_reliability_delta_all.csv",
             "copa_lambda_high_d_reliability_summary.csv",
             "multi_seed_delta_macro_f1.png",
+            "multi_seed_delta_macro_f1_detailed.png",
             "high_d_reliability_delta.png",
+            "high_d_reliability_delta_detailed.png",
+            "relation_state_delta_detailed.png",
+            "direct_add_relation_state_delta_detailed.png",
             "lambda_delta_macro_f1_curve.png",
             "copa_lambda_delta_macro_f1_curve.png",
+            "copa_delta_macro_f1_detailed.png",
+            "copa_high_d_reliability_delta_detailed.png",
+            "copa_relation_state_delta_detailed.png",
+            "relation_state_method_comparison_heatmap.png",
             "experiment_one_conclusion.json",
+            "error_control_report.csv",
         ]
         missing = [name for name in required if not (summary / name).exists()]
         if missing:
             print(f"Multi-seed smoke test failed: missing outputs {missing}", file=sys.stderr)
+            return 1
+        delta_summary = pd.read_csv(summary / "multi_seed_delta_summary.csv")
+        required_columns = {
+            "delta_macro_f1_sem",
+            "delta_macro_f1_ci95_low",
+            "delta_macro_f1_ci95_high",
+            "delta_macro_f1_positive_rate",
+            "delta_macro_f1_negative_rate",
+            "delta_macro_f1_sign_consistency",
+            "delta_macro_f1_passes_error_control",
+        }
+        missing_columns = sorted(required_columns - set(delta_summary.columns))
+        if missing_columns:
+            print(
+                f"Multi-seed smoke test failed: missing error-control columns {missing_columns}",
+                file=sys.stderr,
+            )
             return 1
         print(f"Multi-seed smoke test passed. Outputs checked in {summary}")
         return 0

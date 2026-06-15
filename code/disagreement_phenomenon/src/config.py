@@ -69,6 +69,7 @@ class ExperimentConfig:
     copa_comp_margin: float = 0.2
     patience: int = 8
     num_workers: int = 0
+    deterministic: bool = False
     quiet: bool = False
 
     @property

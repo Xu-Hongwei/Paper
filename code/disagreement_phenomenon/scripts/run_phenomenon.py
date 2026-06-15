@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import random
 import sys
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader
@@ -104,6 +106,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--copa_comp_margin", type=float, default=0.2)
     parser.add_argument("--patience", type=int, default=8)
     parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Enable stricter deterministic seeding for lower run-to-run variance.",
+    )
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Disable per-epoch tqdm progress bars.",
@@ -115,26 +122,39 @@ def make_loaders(
     splits: dict[str, object],
     batch_size: int,
     num_workers: int,
+    seed: int,
 ) -> dict[str, DataLoader]:
     datasets = {name: MultimodalSplitDataset(split) for name, split in splits.items()}
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+
+    def seed_worker(worker_id: int) -> None:
+        worker_seed = seed + worker_id
+        np.random.seed(worker_seed)
+        random.seed(worker_seed)
+
     return {
         "train": DataLoader(
             datasets["train"],
             batch_size=batch_size,
             shuffle=True,
             num_workers=num_workers,
+            worker_init_fn=seed_worker if num_workers > 0 else None,
+            generator=generator,
         ),
         "valid": DataLoader(
             datasets["valid"],
             batch_size=batch_size,
             shuffle=False,
             num_workers=num_workers,
+            worker_init_fn=seed_worker if num_workers > 0 else None,
         ),
         "test": DataLoader(
             datasets["test"],
             batch_size=batch_size,
             shuffle=False,
             num_workers=num_workers,
+            worker_init_fn=seed_worker if num_workers > 0 else None,
         ),
     }
 
@@ -552,15 +572,17 @@ def main() -> int:
         copa_comp_weight=args.copa_comp_weight,
         copa_comp_margin=args.copa_comp_margin,
         patience=args.patience,
+        deterministic=args.deterministic,
         quiet=args.quiet,
     )
 
-    set_seed(cfg.seed)
+    set_seed(cfg.seed, deterministic=cfg.deterministic)
     device = choose_device()
 
     print(f"Dataset: {cfg.dataset}")
     print(f"Data file: {cfg.data_path}")
     print(f"Device: {device}")
+    print(f"Deterministic: {cfg.deterministic}")
 
     try:
         splits = load_npz_splits(cfg.data_path)
@@ -576,7 +598,7 @@ def main() -> int:
     print(f"Output: {run_dir}")
 
     input_dims = infer_input_dims(splits["train"])
-    loaders = make_loaders(splits, cfg.batch_size, cfg.num_workers)
+    loaders = make_loaders(splits, cfg.batch_size, cfg.num_workers, cfg.seed)
 
     save_json(
         run_dir / "config.json",
@@ -601,6 +623,7 @@ def main() -> int:
             "copa_agr_weight": cfg.copa_agr_weight,
             "copa_comp_weight": cfg.copa_comp_weight,
             "copa_comp_margin": cfg.copa_comp_margin,
+            "deterministic": cfg.deterministic,
             "input_dims": input_dims,
             "quiet": cfg.quiet,
         },
