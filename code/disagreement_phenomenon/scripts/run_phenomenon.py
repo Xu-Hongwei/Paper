@@ -22,6 +22,7 @@ from src.disagreement import (  # noqa: E402
     RELATION_STATE_GROUP_ORDER,
     assign_high_d_reliability_groups,
     assign_relation_state_groups,
+    assign_relation_state_groups_balanced,
     build_group_frame,
     grouped_metrics,
     kernel_pairwise_disagreement,
@@ -33,6 +34,7 @@ from src.disagreement import (  # noqa: E402
     sample_disagreement_from_pairwise,
     sample_reliability,
     validation_thresholds,
+    within_group_reliability_thresholds,
     assign_groups,
 )
 from src.model import MultimodalClassifier  # noqa: E402
@@ -40,6 +42,7 @@ from src.plotting import save_delta_plot, save_lambda_curve_plot  # noqa: E402
 from src.train import predict, train_model  # noqa: E402
 from src.utils import choose_device, ensure_dir, save_json, set_seed  # noqa: E402
 from src.v4_analysis import (  # noqa: E402
+    residual_probe_by_mode_frame,
     residual_probe_frame,
 )
 
@@ -65,6 +68,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden_dim", type=int, default=128)
     parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument("--eta_unimodal", type=float, default=0.1)
+    parser.add_argument(
+        "--label_mode",
+        choices=("three_class", "binary"),
+        default="three_class",
+        help="Target label conversion. binary uses sentiment score > 0.",
+    )
     parser.add_argument(
         "--lambda_align_values",
         type=float,
@@ -97,7 +106,10 @@ def parse_args() -> argparse.Namespace:
         "--direct_add_pair_mode",
         choices=("text_anchor", "full_pair"),
         default=None,
-        help="Deprecated override for DirectAdd; must match --pair_mode when set.",
+        help=(
+            "DirectAdd appendix mode. text_anchor is reported as TextInject; "
+            "BalancedDirectAdd is always run as a separate appendix baseline."
+        ),
     )
     parser.add_argument(
         "--run_infonce",
@@ -111,6 +123,13 @@ def parse_args() -> argparse.Namespace:
         default=[0.01, 0.05, 0.1, 0.5],
     )
     parser.add_argument("--nce_temperature", type=float, default=0.1)
+    parser.add_argument(
+        "--use_nce_projection",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use projection heads z_m=P_m(h_m) for InfoNCE while classification uses h_m.",
+    )
+    parser.add_argument("--nce_proj_dim", type=int, default=128)
     parser.add_argument(
         "--nce_pair_mode",
         choices=("text_anchor", "full_pair"),
@@ -153,6 +172,22 @@ def parse_args() -> argparse.Namespace:
         help="Maximum predicted-class samples used for each class-conditional MMD.",
     )
     parser.add_argument(
+        "--relation_split",
+        choices=("balanced_within_d", "global_r"),
+        default="balanced_within_d",
+        help=(
+            "Relation-state reliability split. balanced_within_d uses validation "
+            "Low-D/High-D medians; global_r uses one validation R median."
+        ),
+    )
+    parser.add_argument(
+        "--residual_modes",
+        choices=("abs", "signed", "prod", "all"),
+        nargs="+",
+        default=["abs", "signed", "prod", "all"],
+        help="Residual feature modes for supplementary probe diagnostics.",
+    )
+    parser.add_argument(
         "--tau_agreement",
         type=float,
         default=0.1,
@@ -177,7 +212,6 @@ def parse_args() -> argparse.Namespace:
 def resolve_pair_modes(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     specific_names = (
         "align_pair_mode",
-        "direct_add_pair_mode",
         "nce_pair_mode",
         "disagreement_pair_mode",
         "kernel_pair_mode",
@@ -201,6 +235,8 @@ def resolve_pair_modes(args: argparse.Namespace, parser: argparse.ArgumentParser
                 f"--{name}={value} conflicts with --pair_mode={args.pair_mode}. "
                 "Use one consistent pair mode for the whole run."
             )
+    if args.direct_add_pair_mode is None:
+        args.direct_add_pair_mode = args.pair_mode
 
 
 def make_loaders(
@@ -242,6 +278,13 @@ def make_loaders(
             worker_init_fn=seed_worker if num_workers > 0 else None,
         ),
     }
+
+
+def reset_training_rng(loaders: dict[str, DataLoader], cfg: ExperimentConfig) -> None:
+    set_seed(cfg.seed, deterministic=cfg.deterministic)
+    train_generator = getattr(loaders["train"], "generator", None)
+    if train_generator is not None:
+        train_generator.manual_seed(cfg.seed)
 
 
 def disagreement_distances(
@@ -298,6 +341,7 @@ def new_model(
     cfg: ExperimentConfig,
     *,
     direct_add_alpha: float = 0.0,
+    direct_add_pair_mode: str | None = None,
 ) -> MultimodalClassifier:
     return MultimodalClassifier(
         text_dim=input_dims["text"],
@@ -306,7 +350,10 @@ def new_model(
         hidden_dim=cfg.hidden_dim,
         dropout=cfg.dropout,
         direct_add_alpha=direct_add_alpha,
-        direct_add_pair_mode=cfg.direct_add_pair_mode,
+        direct_add_pair_mode=direct_add_pair_mode or cfg.direct_add_pair_mode,
+        num_classes=cfg.num_classes,
+        use_nce_projection=cfg.use_nce_projection,
+        nce_proj_dim=cfg.nce_proj_dim,
     )
 
 
@@ -386,6 +433,7 @@ def train_best_alignment(
     lambda_reliability_delta_rows: list[dict[str, float]] = []
 
     for lambda_align in cfg.lambda_align_values:
+        reset_training_rng(loaders, cfg)
         model = new_model(input_dims, cfg)
         trained, metrics = train_model(
             model,
@@ -490,6 +538,8 @@ def train_best_direct_add(
     device: torch.device,
     concat_grouped: dict[str, dict[str, float]],
     test_groups,
+    *,
+    direct_add_pair_mode: str | None = None,
 ) -> tuple[
     MultimodalClassifier,
     dict[str, float],
@@ -505,9 +555,16 @@ def train_best_direct_add(
     best_score = -1.0
     sweep_rows: list[dict[str, float]] = []
     alpha_delta_rows: list[dict[str, float]] = []
+    direct_add_pair_mode = direct_add_pair_mode or cfg.direct_add_pair_mode
 
     for alpha in cfg.direct_add_alpha_values:
-        model = new_model(input_dims, cfg, direct_add_alpha=alpha)
+        reset_training_rng(loaders, cfg)
+        model = new_model(
+            input_dims,
+            cfg,
+            direct_add_alpha=alpha,
+            direct_add_pair_mode=direct_add_pair_mode,
+        )
         trained, metrics = train_model(
             model,
             loaders["train"],
@@ -519,14 +576,14 @@ def train_best_direct_add(
             eta_unimodal=0.0,
             lambda_align=0.0,
             patience=cfg.patience,
-            desc=f"DirectAdd α={alpha}",
+            desc=f"{direct_add_method_name(direct_add_pair_mode)} alpha={alpha}",
             show_progress=not cfg.quiet,
         )
         score = metrics.get("macro_f1", -1.0)
         sweep_rows.append(
             {
                 "direct_add_alpha": alpha,
-                "direct_add_pair_mode": cfg.direct_add_pair_mode,
+                "direct_add_pair_mode": direct_add_pair_mode,
                 **metrics,
             }
         )
@@ -552,7 +609,7 @@ def train_best_direct_add(
                     - concat_grouped[group]["macro_f1"],
                     "valid_macro_f1": metrics.get("macro_f1"),
                     "valid_acc": metrics.get("acc"),
-                    "direct_add_pair_mode": cfg.direct_add_pair_mode,
+                    "direct_add_pair_mode": direct_add_pair_mode,
                 }
             )
         if score > best_score:
@@ -604,6 +661,7 @@ def train_best_infonce(
     lambda_reliability_delta_rows: list[dict[str, float]] = []
 
     for lambda_nce in cfg.lambda_nce_values:
+        reset_training_rng(loaders, cfg)
         model = new_model(input_dims, cfg)
         trained, metrics = train_model(
             model,
@@ -627,6 +685,8 @@ def train_best_infonce(
                 "lambda_nce": lambda_nce,
                 "nce_temperature": cfg.nce_temperature,
                 "nce_pair_mode": cfg.nce_pair_mode,
+                "use_nce_projection": cfg.use_nce_projection,
+                "nce_proj_dim": cfg.nce_proj_dim,
                 **metrics,
             }
         )
@@ -650,6 +710,8 @@ def train_best_infonce(
                     "lambda_nce": lambda_nce,
                     "nce_temperature": cfg.nce_temperature,
                     "nce_pair_mode": cfg.nce_pair_mode,
+                    "use_nce_projection": cfg.use_nce_projection,
+                    "nce_proj_dim": cfg.nce_proj_dim,
                     "group": group,
                     "n": infonce_grouped[group]["n"],
                     "concat_acc": concat_grouped[group]["acc"],
@@ -669,6 +731,8 @@ def train_best_infonce(
                     "lambda_nce": lambda_nce,
                     "nce_temperature": cfg.nce_temperature,
                     "nce_pair_mode": cfg.nce_pair_mode,
+                    "use_nce_projection": cfg.use_nce_projection,
+                    "nce_proj_dim": cfg.nce_proj_dim,
                     "group": group,
                     "n": infonce_reliability_grouped[group]["n"],
                     "concat_acc": concat_reliability_grouped[group]["acc"],
@@ -705,6 +769,91 @@ def train_best_infonce(
     )
 
 
+def relation_state_split(
+    train_groups: np.ndarray,
+    valid_groups: np.ndarray,
+    test_groups: np.ndarray,
+    train_r: np.ndarray,
+    valid_r: np.ndarray,
+    test_r: np.ndarray,
+    *,
+    relation_split: str,
+) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
+    q_r = reliability_threshold(valid_r)
+    if relation_split == "global_r":
+        thresholds = {"global": q_r, "Low-D": q_r, "High-D": q_r}
+        train_states = assign_relation_state_groups(train_groups, train_r, q_r)
+        test_states = assign_relation_state_groups(test_groups, test_r, q_r)
+        return train_states, test_states, thresholds
+    if relation_split == "balanced_within_d":
+        thresholds = within_group_reliability_thresholds(valid_groups, valid_r)
+        train_states = assign_relation_state_groups_balanced(
+            train_groups,
+            train_r,
+            thresholds,
+        )
+        test_states = assign_relation_state_groups_balanced(
+            test_groups,
+            test_r,
+            thresholds,
+        )
+        return train_states, test_states, thresholds
+    raise ValueError("relation_split must be 'balanced_within_d' or 'global_r'.")
+
+
+def relation_state_calibration_frame(
+    pred: dict[str, np.ndarray],
+    relation_states: np.ndarray,
+    reliability: dict[str, np.ndarray],
+    *,
+    label_mode: str,
+    relation_split: str,
+) -> pd.DataFrame:
+    y_true = pred["y_true"]
+    modality_preds = {
+        "text_acc": pred["prob_t"].argmax(axis=1),
+        "audio_acc": pred["prob_a"].argmax(axis=1),
+        "vision_acc": pred["prob_v"].argmax(axis=1),
+        "fusion_acc": pred["prob_f"].argmax(axis=1),
+    }
+    rows: list[dict[str, object]] = []
+    classes = sorted(int(label) for label in np.unique(y_true))
+    for group in RELATION_STATE_GROUP_ORDER:
+        mask = relation_states == group
+        n = int(mask.sum())
+        row: dict[str, object] = {
+            "group": group,
+            "relation_state_desc": {
+                "RA": "Low-D+High-R",
+                "UA": "Low-D+Low-R",
+                "Mid-D": "Mid-D",
+                "RD": "High-D+High-R",
+                "ND": "High-D+Low-R",
+            }.get(group, group),
+            "label_mode": label_mode,
+            "relation_split": relation_split,
+            "n": n,
+            "avg_R": float(np.mean(reliability["R_sample"][mask])) if n else float("nan"),
+            "avg_R_text": float(np.mean(reliability["R_text"][mask])) if n else float("nan"),
+            "avg_R_audio": float(np.mean(reliability["R_audio"][mask])) if n else float("nan"),
+            "avg_R_vision": float(np.mean(reliability["R_vision"][mask])) if n else float("nan"),
+        }
+        for label in classes:
+            row[f"class_{label}_ratio"] = (
+                float((y_true[mask] == label).mean()) if n else float("nan")
+            )
+        for name, y_pred in modality_preds.items():
+            row[name] = float((y_pred[mask] == y_true[mask]).mean()) if n else float("nan")
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def direct_add_method_name(direct_add_pair_mode: str) -> str:
+    if direct_add_pair_mode == "text_anchor":
+        return "TextInject"
+    return "DirectAdd"
+
+
 def main() -> int:
     args = parse_args()
     cfg = ExperimentConfig(
@@ -720,6 +869,7 @@ def main() -> int:
         hidden_dim=args.hidden_dim,
         dropout=args.dropout,
         eta_unimodal=args.eta_unimodal,
+        label_mode=args.label_mode,
         lambda_align_values=args.lambda_align_values,
         direct_add_alpha_values=args.direct_add_alpha_values,
         pair_mode=args.pair_mode,
@@ -729,12 +879,16 @@ def main() -> int:
         lambda_nce_values=args.lambda_nce_values,
         nce_temperature=args.nce_temperature,
         nce_pair_mode=args.nce_pair_mode,
+        use_nce_projection=args.use_nce_projection,
+        nce_proj_dim=args.nce_proj_dim,
         disagreement_metric=args.disagreement_metric,
         disagreement_pair_mode=args.disagreement_pair_mode,
         kernel_bandwidth=args.kernel_bandwidth,
         kernel_pair_mode=args.kernel_pair_mode,
         kernel_class_weight=args.kernel_class_weight,
         kernel_max_class_samples=args.kernel_max_class_samples,
+        relation_split=args.relation_split,
+        residual_modes=args.residual_modes,
         tau_agreement=args.tau_agreement,
         patience=args.patience,
         deterministic=args.deterministic,
@@ -746,11 +900,13 @@ def main() -> int:
 
     print(f"Dataset: {cfg.dataset}")
     print(f"Data file: {cfg.data_path}")
+    print(f"Label mode: {cfg.label_mode}")
+    print(f"Relation split: {cfg.relation_split}")
     print(f"Device: {device}")
     print(f"Deterministic: {cfg.deterministic}")
 
     try:
-        splits = load_npz_splits(cfg.data_path)
+        splits = load_npz_splits(cfg.data_path, label_mode=cfg.label_mode)
     except Exception as exc:
         print(str(exc), file=sys.stderr)
         return 2
@@ -779,6 +935,8 @@ def main() -> int:
             "hidden_dim": cfg.hidden_dim,
             "dropout": cfg.dropout,
             "eta_unimodal": cfg.eta_unimodal,
+            "label_mode": cfg.label_mode,
+            "num_classes": cfg.num_classes,
             "lambda_align_values": cfg.lambda_align_values,
             "direct_add_alpha_values": cfg.direct_add_alpha_values,
             "pair_mode": cfg.pair_mode,
@@ -788,12 +946,16 @@ def main() -> int:
             "lambda_nce_values": cfg.lambda_nce_values,
             "nce_temperature": cfg.nce_temperature,
             "nce_pair_mode": cfg.nce_pair_mode,
+            "use_nce_projection": cfg.use_nce_projection,
+            "nce_proj_dim": cfg.nce_proj_dim,
             "disagreement_metric": cfg.disagreement_metric,
             "disagreement_pair_mode": cfg.disagreement_pair_mode,
             "kernel_bandwidth": cfg.kernel_bandwidth,
             "kernel_pair_mode": cfg.kernel_pair_mode,
             "kernel_class_weight": cfg.kernel_class_weight,
             "kernel_max_class_samples": cfg.kernel_max_class_samples,
+            "relation_split": cfg.relation_split,
+            "residual_modes": cfg.residual_modes,
             "tau_agreement": cfg.tau_agreement,
             "deterministic": cfg.deterministic,
             "input_dims": input_dims,
@@ -834,6 +996,7 @@ def main() -> int:
     )
     q33, q66 = validation_thresholds(valid_d)
     train_groups = assign_groups(train_d, q33, q66)
+    valid_groups = assign_groups(valid_d, q33, q66)
     test_groups = assign_groups(test_d, q33, q66)
     train_reliability = sample_reliability(
         train_diag["prob_t"],
@@ -853,17 +1016,16 @@ def main() -> int:
         test_diag["prob_a"],
         pair_mode=cfg.pair_mode,
     )
-    q_r = reliability_threshold(valid_reliability["R_sample"])
-    train_relation_states = assign_relation_state_groups(
+    train_relation_states, test_relation_states, relation_thresholds = relation_state_split(
         train_groups,
-        train_reliability["R_sample"],
-        q_r,
-    )
-    test_relation_states = assign_relation_state_groups(
+        valid_groups,
         test_groups,
+        train_reliability["R_sample"],
+        valid_reliability["R_sample"],
         test_reliability["R_sample"],
-        q_r,
+        relation_split=cfg.relation_split,
     )
+    q_r = relation_thresholds["global"]
     test_relations = {
         **test_distances,
         **relation_gates(
@@ -879,7 +1041,9 @@ def main() -> int:
     test_reliability_groups = assign_high_d_reliability_groups(
         test_groups,
         test_reliability["R_sample"],
-        q_r,
+        relation_thresholds["High-D"]
+        if cfg.relation_split == "balanced_within_d"
+        else q_r,
     )
     group_df = build_group_frame(
         test_diag,
@@ -894,10 +1058,25 @@ def main() -> int:
     group_df["disagreement_metric"] = cfg.disagreement_metric
     group_df["disagreement_pair_mode"] = cfg.disagreement_pair_mode
     group_df["kernel_pair_mode"] = cfg.kernel_pair_mode
+    group_df["label_mode"] = cfg.label_mode
+    group_df["relation_split"] = cfg.relation_split
     group_df["resolved_kernel_bandwidth"] = (
         resolved_kernel_bandwidth if cfg.disagreement_metric == "kernel_mmd" else ""
     )
     group_df.to_csv(run_dir / "test_groups.csv", index=False, encoding="utf-8-sig")
+
+    calibration_df = relation_state_calibration_frame(
+        test_diag,
+        test_relation_states,
+        test_reliability,
+        label_mode=cfg.label_mode,
+        relation_split=cfg.relation_split,
+    )
+    calibration_df.to_csv(
+        run_dir / "relation_state_distribution_calibration.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
 
     residual_probe_df = residual_probe_frame(
         train_diag,
@@ -908,6 +1087,19 @@ def main() -> int:
     )
     residual_probe_df.to_csv(
         run_dir / "residual_discriminative_probe.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    residual_probe_by_mode_df = residual_probe_by_mode_frame(
+        train_diag,
+        test_diag,
+        train_relation_states,
+        test_relation_states,
+        cfg.seed,
+        residual_modes=cfg.residual_modes,
+    )
+    residual_probe_by_mode_df.to_csv(
+        run_dir / "residual_probe_by_mode.csv",
         index=False,
         encoding="utf-8-sig",
     )
@@ -1009,6 +1201,59 @@ def main() -> int:
         index=False,
         encoding="utf-8-sig",
     )
+    (
+        balanced_direct_add_model,
+        balanced_direct_add_valid,
+        best_balanced_direct_add_alpha,
+        balanced_direct_add_sweep_rows,
+        balanced_direct_add_grouped,
+        balanced_direct_add_alpha_delta_rows,
+    ) = train_best_direct_add(
+        input_dims,
+        loaders,
+        cfg,
+        device,
+        concat_grouped,
+        test_groups,
+        direct_add_pair_mode="balanced",
+    )
+    balanced_direct_add_pred = predict(balanced_direct_add_model, loaders["test"], device)
+    balanced_direct_add_relation_grouped = grouped_metrics(
+        balanced_direct_add_pred["y_true"],
+        balanced_direct_add_pred["y_pred"],
+        test_relation_states,
+        group_order=RELATION_STATE_GROUP_ORDER,
+        include_overall=False,
+    )
+    pd.DataFrame(balanced_direct_add_sweep_rows).to_csv(
+        run_dir / "balanced_direct_add_alpha_sweep_valid.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    pd.DataFrame(balanced_direct_add_alpha_delta_rows).to_csv(
+        run_dir / "balanced_direct_add_alpha_test_delta_metrics.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    balanced_direct_add_delta_rows = []
+    for group in ("Low-D", "Mid-D", "High-D", "Overall"):
+        balanced_direct_add_delta_rows.append(
+            {
+                "group": group,
+                "delta_acc": balanced_direct_add_grouped[group]["acc"]
+                - concat_grouped[group]["acc"],
+                "delta_macro_f1": balanced_direct_add_grouped[group]["macro_f1"]
+                - concat_grouped[group]["macro_f1"],
+                "direct_add_alpha": best_balanced_direct_add_alpha,
+                "direct_add_pair_mode": "balanced",
+            }
+        )
+    balanced_direct_add_delta_df = pd.DataFrame(balanced_direct_add_delta_rows)
+    balanced_direct_add_delta_df.to_csv(
+        run_dir / "balanced_direct_add_delta_metrics.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
 
     infonce_model = None
     infonce_valid = None
@@ -1072,6 +1317,8 @@ def main() -> int:
                     "lambda_nce": best_lambda_nce,
                     "nce_temperature": cfg.nce_temperature,
                     "nce_pair_mode": cfg.nce_pair_mode,
+                    "use_nce_projection": cfg.use_nce_projection,
+                    "nce_proj_dim": cfg.nce_proj_dim,
                 }
             )
         infonce_delta_df = pd.DataFrame(infonce_delta_rows)
@@ -1092,6 +1339,8 @@ def main() -> int:
                     "lambda_nce": best_lambda_nce,
                     "nce_temperature": cfg.nce_temperature,
                     "nce_pair_mode": cfg.nce_pair_mode,
+                    "use_nce_projection": cfg.use_nce_projection,
+                    "nce_proj_dim": cfg.nce_proj_dim,
                 }
             )
         infonce_reliability_delta_df = pd.DataFrame(infonce_reliability_delta_rows)
@@ -1120,7 +1369,7 @@ def main() -> int:
         )
     )
     direct_add_relation_rows = rows_for_method(
-        "DirectAdd",
+        direct_add_method_name(cfg.direct_add_pair_mode),
         direct_add_relation_grouped,
         group_order=RELATION_STATE_GROUP_ORDER,
         include_overall=False,
@@ -1129,6 +1378,16 @@ def main() -> int:
         row["direct_add_alpha"] = best_direct_add_alpha
         row["direct_add_pair_mode"] = cfg.direct_add_pair_mode
     relation_state_rows.extend(direct_add_relation_rows)
+    balanced_direct_add_relation_rows = rows_for_method(
+        "BalancedDirectAdd",
+        balanced_direct_add_relation_grouped,
+        group_order=RELATION_STATE_GROUP_ORDER,
+        include_overall=False,
+    )
+    for row in balanced_direct_add_relation_rows:
+        row["direct_add_alpha"] = best_balanced_direct_add_alpha
+        row["direct_add_pair_mode"] = "balanced"
+    relation_state_rows.extend(balanced_direct_add_relation_rows)
     if cfg.run_infonce and infonce_relation_grouped is not None:
         infonce_relation_rows = rows_for_method(
             "UncondInfoNCE",
@@ -1140,6 +1399,8 @@ def main() -> int:
             row["lambda_nce"] = best_lambda_nce
             row["nce_temperature"] = cfg.nce_temperature
             row["nce_pair_mode"] = cfg.nce_pair_mode
+            row["use_nce_projection"] = cfg.use_nce_projection
+            row["nce_proj_dim"] = cfg.nce_proj_dim
         relation_state_rows.extend(infonce_relation_rows)
     for row in relation_state_rows:
         if row.get("method") == "UncondAlign":
@@ -1169,6 +1430,11 @@ def main() -> int:
         index=False,
         encoding="utf-8-sig",
     )
+    relation_state_delta_df.to_csv(
+        run_dir / "uncond_align_relation_delta.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
     direct_add_relation_state_delta_rows = []
     for group in RELATION_STATE_GROUP_ORDER:
         direct_add_relation_state_delta_rows.append(
@@ -1188,6 +1454,27 @@ def main() -> int:
         index=False,
         encoding="utf-8-sig",
     )
+    balanced_direct_add_relation_state_delta_rows = []
+    for group in RELATION_STATE_GROUP_ORDER:
+        balanced_direct_add_relation_state_delta_rows.append(
+            {
+                "group": group,
+                "delta_acc": balanced_direct_add_relation_grouped[group]["acc"]
+                - concat_relation_grouped[group]["acc"],
+                "delta_macro_f1": balanced_direct_add_relation_grouped[group]["macro_f1"]
+                - concat_relation_grouped[group]["macro_f1"],
+                "direct_add_alpha": best_balanced_direct_add_alpha,
+                "direct_add_pair_mode": "balanced",
+            }
+        )
+    balanced_direct_add_relation_state_delta_df = pd.DataFrame(
+        balanced_direct_add_relation_state_delta_rows
+    )
+    balanced_direct_add_relation_state_delta_df.to_csv(
+        run_dir / "balanced_direct_add_relation_state_delta.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
     if cfg.run_infonce and infonce_relation_grouped is not None:
         infonce_relation_state_delta_rows = []
         for group in RELATION_STATE_GROUP_ORDER:
@@ -1201,10 +1488,18 @@ def main() -> int:
                     "lambda_nce": best_lambda_nce,
                     "nce_temperature": cfg.nce_temperature,
                     "nce_pair_mode": cfg.nce_pair_mode,
+                    "use_nce_projection": cfg.use_nce_projection,
+                    "nce_proj_dim": cfg.nce_proj_dim,
                 }
             )
-        pd.DataFrame(infonce_relation_state_delta_rows).to_csv(
+        infonce_relation_delta_df = pd.DataFrame(infonce_relation_state_delta_rows)
+        infonce_relation_delta_df.to_csv(
             run_dir / "infonce_relation_state_delta.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        infonce_relation_delta_df.to_csv(
+            run_dir / "infonce_relation_delta.csv",
             index=False,
             encoding="utf-8-sig",
         )
@@ -1220,6 +1515,9 @@ def main() -> int:
                 "concat_macro_f1": concat_relation_grouped[group]["macro_f1"],
                 "uncond_align_macro_f1": align_relation_grouped[group]["macro_f1"],
                 "direct_add_macro_f1": direct_add_relation_grouped[group]["macro_f1"],
+                "balanced_direct_add_macro_f1": balanced_direct_add_relation_grouped[
+                    group
+                ]["macro_f1"],
                 "infonce_macro_f1": (
                     infonce_relation_grouped[group]["macro_f1"]
                     if infonce_relation_grouped is not None
@@ -1269,8 +1567,11 @@ def main() -> int:
                 "align_pair_mode": cfg.align_pair_mode,
                 "direct_add_alpha": best_direct_add_alpha,
                 "direct_add_pair_mode": cfg.direct_add_pair_mode,
+                "balanced_direct_add_alpha": best_balanced_direct_add_alpha,
                 "lambda_nce": best_lambda_nce,
                 "nce_pair_mode": cfg.nce_pair_mode if cfg.run_infonce else "",
+                "use_nce_projection": cfg.use_nce_projection if cfg.run_infonce else "",
+                "nce_proj_dim": cfg.nce_proj_dim if cfg.run_infonce else "",
             }
         )
     concat_aware_df = pd.DataFrame(concat_aware_rows)
@@ -1283,17 +1584,30 @@ def main() -> int:
     rows = []
     rows.extend(rows_for_method("Concat", concat_grouped))
     rows.extend(rows_for_method("UncondAlign", align_grouped, lambda_align=best_lambda))
-    direct_add_rows = rows_for_method("DirectAdd", direct_add_grouped)
+    direct_add_rows = rows_for_method(
+        direct_add_method_name(cfg.direct_add_pair_mode),
+        direct_add_grouped,
+    )
     for row in direct_add_rows:
         row["direct_add_alpha"] = best_direct_add_alpha
         row["direct_add_pair_mode"] = cfg.direct_add_pair_mode
     rows.extend(direct_add_rows)
+    balanced_direct_add_rows = rows_for_method(
+        "BalancedDirectAdd",
+        balanced_direct_add_grouped,
+    )
+    for row in balanced_direct_add_rows:
+        row["direct_add_alpha"] = best_balanced_direct_add_alpha
+        row["direct_add_pair_mode"] = "balanced"
+    rows.extend(balanced_direct_add_rows)
     if cfg.run_infonce and infonce_grouped is not None:
         infonce_rows = rows_for_method("UncondInfoNCE", infonce_grouped)
         for row in infonce_rows:
             row["lambda_nce"] = best_lambda_nce
             row["nce_temperature"] = cfg.nce_temperature
             row["nce_pair_mode"] = cfg.nce_pair_mode
+            row["use_nce_projection"] = cfg.use_nce_projection
+            row["nce_proj_dim"] = cfg.nce_proj_dim
         rows.extend(infonce_rows)
     for row in rows:
         if row.get("method") == "UncondAlign":
@@ -1365,6 +1679,8 @@ def main() -> int:
             row["lambda_nce"] = best_lambda_nce
             row["nce_temperature"] = cfg.nce_temperature
             row["nce_pair_mode"] = cfg.nce_pair_mode
+            row["use_nce_projection"] = cfg.use_nce_projection
+            row["nce_proj_dim"] = cfg.nce_proj_dim
         reliability_rows.extend(infonce_reliability_rows)
     for row in reliability_rows:
         if row.get("method") == "UncondAlign":
@@ -1399,6 +1715,10 @@ def main() -> int:
     torch.save(concat_model.state_dict(), run_dir / "concat_model.pt")
     torch.save(align_model.state_dict(), run_dir / "uncond_align_model.pt")
     torch.save(direct_add_model.state_dict(), run_dir / "direct_add_model.pt")
+    torch.save(
+        balanced_direct_add_model.state_dict(),
+        run_dir / "balanced_direct_add_model.pt",
+    )
     if cfg.run_infonce and infonce_model is not None:
         torch.save(infonce_model.state_dict(), run_dir / "infonce_model.pt")
     save_json(
@@ -1408,25 +1728,38 @@ def main() -> int:
             "concat_valid": concat_valid,
             "uncond_align_valid": align_valid,
             "best_lambda_align": best_lambda,
+            "label_mode": cfg.label_mode,
+            "num_classes": cfg.num_classes,
             "pair_mode": cfg.pair_mode,
             "align_pair_mode": cfg.align_pair_mode,
             "direct_add_valid": direct_add_valid,
             "best_direct_add_alpha": best_direct_add_alpha,
             "direct_add_pair_mode": cfg.direct_add_pair_mode,
+            "balanced_direct_add_valid": balanced_direct_add_valid,
+            "best_balanced_direct_add_alpha": best_balanced_direct_add_alpha,
             "infonce_valid": infonce_valid,
             "best_lambda_nce": best_lambda_nce,
             "nce_temperature": cfg.nce_temperature,
             "nce_pair_mode": cfg.nce_pair_mode,
+            "use_nce_projection": cfg.use_nce_projection,
+            "nce_proj_dim": cfg.nce_proj_dim,
             "disagreement_metric": cfg.disagreement_metric,
             "disagreement_pair_mode": cfg.disagreement_pair_mode,
             "kernel_bandwidth": cfg.kernel_bandwidth,
             "kernel_pair_mode": cfg.kernel_pair_mode,
             "kernel_class_weight": cfg.kernel_class_weight,
             "kernel_max_class_samples": cfg.kernel_max_class_samples,
+            "relation_split": cfg.relation_split,
+            "residual_modes": cfg.residual_modes,
             "resolved_kernel_bandwidth": resolved_kernel_bandwidth
             if cfg.disagreement_metric == "kernel_mmd"
             else None,
-            "thresholds": {"q33": q33, "q66": q66, "q_r": q_r},
+            "thresholds": {
+                "q33": q33,
+                "q66": q66,
+                "q_r": q_r,
+                **{f"r_{key}": value for key, value in relation_thresholds.items()},
+            },
             "high_d_reliability_counts": {
                 group: int((test_reliability_groups == group).sum())
                 for group in HIGH_D_RELIABILITY_GROUP_ORDER
@@ -1444,6 +1777,8 @@ def main() -> int:
     print(delta_df.to_string(index=False))
     print("\nDirectAdd delta metrics:")
     print(direct_add_delta_df.to_string(index=False))
+    print("\nBalancedDirectAdd delta metrics:")
+    print(balanced_direct_add_delta_df.to_string(index=False))
     if cfg.run_infonce:
         print("\nInfoNCE delta metrics:")
         print(infonce_delta_df.to_string(index=False))
@@ -1453,8 +1788,12 @@ def main() -> int:
     print(reliability_delta_df.to_string(index=False))
     print("\nRelation-state delta metrics:")
     print(relation_state_delta_df.to_string(index=False))
+    print("\nRelation-state distribution/calibration:")
+    print(calibration_df.to_string(index=False))
     print("\nDirectAdd relation-state delta metrics:")
     print(direct_add_relation_state_delta_df.to_string(index=False))
+    print("\nBalancedDirectAdd relation-state delta metrics:")
+    print(balanced_direct_add_relation_state_delta_df.to_string(index=False))
     print("\nConcat-aware motivation table:")
     print(concat_aware_df.to_string(index=False))
     print(f"\nSaved outputs to: {run_dir}")

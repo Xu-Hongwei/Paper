@@ -85,6 +85,8 @@ def main() -> int:
             "0.01",
             "--pair_mode",
             "text_anchor",
+            "--relation_split",
+            "balanced_within_d",
             "--disagreement_metric",
             "kernel_mmd",
             "--kernel_max_class_samples",
@@ -111,17 +113,29 @@ def main() -> int:
             "direct_add_delta_summary.csv",
             "direct_add_alpha_test_delta_all.csv",
             "direct_add_alpha_test_delta_summary.csv",
+            "balanced_direct_add_delta_all.csv",
+            "balanced_direct_add_delta_summary.csv",
+            "balanced_direct_add_alpha_test_delta_all.csv",
+            "balanced_direct_add_alpha_test_delta_summary.csv",
             "high_d_reliability_summary.csv",
             "relation_state_delta_all.csv",
             "relation_state_delta_summary.csv",
+            "uncond_align_relation_delta_all.csv",
+            "uncond_align_relation_delta_summary.csv",
             "relation_state_metrics_all.csv",
             "relation_state_metrics_summary.csv",
+            "relation_state_distribution_calibration_all.csv",
+            "relation_state_distribution_calibration_summary.csv",
             "direct_add_relation_state_delta_all.csv",
             "direct_add_relation_state_delta_summary.csv",
+            "balanced_direct_add_relation_state_delta_all.csv",
+            "balanced_direct_add_relation_state_delta_summary.csv",
             "concat_aware_motivation_all.csv",
             "concat_aware_motivation_summary.csv",
             "residual_discriminative_probe_all.csv",
             "residual_discriminative_probe_summary.csv",
+            "residual_probe_by_mode_all.csv",
+            "residual_probe_by_mode_summary.csv",
             "lambda_test_delta_all.csv",
             "lambda_test_delta_summary.csv",
             "lambda_high_d_reliability_delta_all.csv",
@@ -132,6 +146,8 @@ def main() -> int:
             "infonce_high_d_reliability_summary.csv",
             "infonce_relation_state_delta_all.csv",
             "infonce_relation_state_delta_summary.csv",
+            "infonce_relation_delta_all.csv",
+            "infonce_relation_delta_summary.csv",
             "infonce_lambda_test_delta_all.csv",
             "infonce_lambda_test_delta_summary.csv",
             "infonce_lambda_high_d_reliability_delta_all.csv",
@@ -142,6 +158,7 @@ def main() -> int:
             "high_d_reliability_delta_detailed.png",
             "relation_state_delta_detailed.png",
             "direct_add_relation_state_delta_detailed.png",
+            "balanced_direct_add_relation_state_delta_detailed.png",
             "lambda_delta_macro_f1_curve.png",
             "infonce_lambda_delta_macro_f1_curve.png",
             "infonce_delta_macro_f1_detailed.png",
@@ -194,6 +211,43 @@ def main() -> int:
         if infonce_summary.empty or "lambda_nce" not in infonce_summary.columns:
             print("Multi-seed smoke test failed: InfoNCE summary is empty.", file=sys.stderr)
             return 1
+        infonce_config_columns = {
+            "nce_pair_mode",
+            "nce_temperature",
+            "use_nce_projection",
+            "nce_proj_dim",
+        }
+        missing_infonce_config = sorted(infonce_config_columns - set(infonce_summary.columns))
+        if missing_infonce_config:
+            print(
+                f"Multi-seed smoke test failed: missing InfoNCE config columns {missing_infonce_config}",
+                file=sys.stderr,
+            )
+            return 1
+        calibration_summary = pd.read_csv(
+            summary / "relation_state_distribution_calibration_summary.csv"
+        )
+        calibration_columns = {
+            "avg_R_mean",
+            "text_acc_mean",
+            "audio_acc_mean",
+            "vision_acc_mean",
+            "fusion_acc_mean",
+        }
+        missing_calibration = sorted(calibration_columns - set(calibration_summary.columns))
+        if missing_calibration:
+            print(
+                f"Multi-seed smoke test failed: missing calibration summary columns {missing_calibration}",
+                file=sys.stderr,
+            )
+            return 1
+        residual_by_mode = pd.read_csv(summary / "residual_probe_by_mode_summary.csv")
+        if residual_by_mode.empty or "matched_residual_gain_macro_f1_mean" not in residual_by_mode:
+            print(
+                "Multi-seed smoke test failed: residual by-mode summary is incomplete.",
+                file=sys.stderr,
+            )
+            return 1
         align_all = pd.read_csv(summary / "lambda_test_delta_all.csv")
         if align_all.empty or set(align_all["align_pair_mode"]) != {"text_anchor"}:
             print(
@@ -205,6 +259,20 @@ def main() -> int:
         if direct_all.empty or set(direct_all["direct_add_pair_mode"]) != {"text_anchor"}:
             print(
                 "Multi-seed smoke test failed: DirectAdd all-seed pair mode is wrong.",
+                file=sys.stderr,
+            )
+            return 1
+        balanced_all = pd.read_csv(summary / "balanced_direct_add_alpha_test_delta_all.csv")
+        if balanced_all.empty or set(balanced_all["direct_add_pair_mode"]) != {"balanced"}:
+            print(
+                "Multi-seed smoke test failed: BalancedDirectAdd all-seed mode is wrong.",
+                file=sys.stderr,
+            )
+            return 1
+        group_summary = pd.read_csv(summary / "multi_seed_group_metrics_summary.csv")
+        if "BalancedDirectAdd" not in set(group_summary["method"]):
+            print(
+                "Multi-seed smoke test failed: BalancedDirectAdd summary row is missing.",
                 file=sys.stderr,
             )
             return 1

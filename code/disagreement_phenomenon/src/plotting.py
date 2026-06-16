@@ -10,6 +10,12 @@ from .disagreement import GROUP_ORDER, HIGH_D_RELIABILITY_GROUP_ORDER, RELATION_
 
 
 def save_delta_plot(delta_df: pd.DataFrame, path: Path) -> None:
+    """保存按分歧分组的分组柱状图（单次实验版）。
+
+    Args:
+        delta_df: 包含 "group" 和 "delta_macro_f1" 列的 DataFrame。
+        path: 图片保存路径。
+    """
     plot_df = delta_df[delta_df["group"].isin(GROUP_ORDER)].copy()
     plot_df["group"] = pd.Categorical(plot_df["group"], GROUP_ORDER, ordered=True)
     plot_df = plot_df.sort_values("group")
@@ -36,6 +42,15 @@ def save_delta_plot(delta_df: pd.DataFrame, path: Path) -> None:
 
 
 def save_multi_seed_delta_plot(summary_df: pd.DataFrame, path: Path) -> None:
+    """保存按分歧分组并带误差棒的柱状图（多 seed 汇总版）。
+
+    优先使用 95% 置信区间作为误差棒，回退到标准差。
+
+    Args:
+        summary_df: 多 seed 汇总 DataFrame，需含 "group" 和 "delta_macro_f1_mean"
+                    及 "delta_macro_f1_ci95_high" 或 "delta_macro_f1_std"。
+        path: 图片保存路径。
+    """
     plot_df = summary_df[summary_df["group"].isin(GROUP_ORDER)].copy()
     plot_df["group"] = pd.Categorical(plot_df["group"], GROUP_ORDER, ordered=True)
     plot_df = plot_df.sort_values("group")
@@ -72,6 +87,13 @@ def save_multi_seed_delta_plot(summary_df: pd.DataFrame, path: Path) -> None:
 
 
 def save_reliability_delta_plot(summary_df: pd.DataFrame, path: Path) -> None:
+    """保存 High-D 可靠性子组的柱状图（High-D+Low-R vs High-D+High-R）。
+
+    Args:
+        summary_df: 汇总 DataFrame，需含 "group" 和 "delta_macro_f1_mean"
+                    及误差列。
+        path: 图片保存路径。
+    """
     if "delta_macro_f1_ci95_high" in summary_df.columns:
         yerr = (
             summary_df["delta_macro_f1_ci95_high"] - summary_df["delta_macro_f1_mean"]
@@ -99,6 +121,17 @@ def save_reliability_delta_plot(summary_df: pd.DataFrame, path: Path) -> None:
 
 
 def _summary_error(summary_df: pd.DataFrame, value_col: str) -> pd.Series:
+    """从汇总 DataFrame 中提取误差棒值。
+
+    优先使用 95% CI 半宽，回退到标准差，否则返回 0。
+
+    Args:
+        summary_df: 汇总 DataFrame。
+        value_col: 指标列名前缀（如 "delta_macro_f1"）。
+
+    Returns:
+        误差值 Series。
+    """
     mean_col = f"{value_col}_mean"
     ci_high_col = f"{value_col}_ci95_high"
     std_col = f"{value_col}_std"
@@ -119,6 +152,20 @@ def save_detailed_delta_plot(
     title: str,
     ylabel: str = "Delta Macro-F1",
 ) -> None:
+    """保存详细的分组柱状图，含误差棒、散点、标注（多 seed 综合版）。
+
+    柱色：绿色 = 通过 error control，蓝色 = 未通过。
+    每个柱上标注均值、seed 数、方向一致性比例，以及散点表示各 seed 值。
+
+    Args:
+        all_df: 所有 seed 的明细 DataFrame，每行一个 seed×group。
+        summary_df: 跨 seed 汇总 DataFrame。
+        path: 图片保存路径。
+        group_order: 分组显示顺序。
+        value_col: 指标列名前缀。
+        title: 图表标题。
+        ylabel: Y 轴标签。
+    """
     plot_all = all_df[all_df["group"].isin(group_order)].copy()
     plot_summary = summary_df[summary_df["group"].isin(group_order)].copy()
     plot_summary["group"] = pd.Categorical(plot_summary["group"], group_order, ordered=True)
@@ -224,6 +271,18 @@ def save_method_relation_state_heatmap(
     value_col: str = "delta_macro_f1",
     title: str = "Relation-state delta comparison",
 ) -> None:
+    """保存多方法×关系状态的热力图。
+
+    行 = 方法，列 = 关系状态（RA/UA/Mid-D/RD/ND），颜色用 RdBu_r 表示 delta 值。
+    每个单元格标注均值、95% CI、符号一致性比例。
+
+    Args:
+        summaries: {方法名: 汇总 DataFrame} 的字典。
+        path: 图片保存路径。
+        group_order: 列（关系状态）的显示顺序。
+        value_col: 指标列名前缀。
+        title: 图表标题。
+    """
     methods = [method for method, frame in summaries.items() if frame is not None and not frame.empty]
     if not methods:
         return
@@ -303,6 +362,19 @@ def save_lambda_curve_plot(
     y_label: str = "Delta Macro-F1 (UncondAlign - Concat)",
     raw_frame: pd.DataFrame | None = None,
 ) -> None:
+    """保存 λ 对齐强度曲线图（X 轴对数刻度）。
+
+    每条线对应一个分歧分组，可叠加各 seed 的原始折线作为背景。
+
+    Args:
+        frame: 汇总 DataFrame，需含 group、x_col、value_col 及误差列。
+        path: 图片保存路径。
+        title: 图表标题。
+        x_col: X 轴列名。
+        x_label: X 轴标签。
+        y_label: Y 轴标签。
+        raw_frame: 可选，各 seed 的原始数据，用于绘制背景灰线。
+    """
     plot_df = frame[frame["group"].isin(GROUP_ORDER)].copy()
     plot_df["group"] = pd.Categorical(plot_df["group"], GROUP_ORDER, ordered=True)
     plot_df = plot_df.sort_values(["group", x_col])

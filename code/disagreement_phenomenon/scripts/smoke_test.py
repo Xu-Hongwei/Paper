@@ -7,10 +7,15 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import torch
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 RUNNER = ROOT / "scripts" / "run_phenomenon.py"
+
+from src.model import unconditional_alignment_loss, unconditional_infonce_loss  # noqa: E402
 
 
 def make_fixture(path: Path) -> None:
@@ -49,7 +54,36 @@ def make_fixture(path: Path) -> None:
     )
 
 
+def check_projection_loss_boundary() -> None:
+    torch.manual_seed(3)
+    outputs = {
+        "h_t": torch.randn(6, 5),
+        "h_a": torch.randn(6, 5),
+        "h_v": torch.randn(6, 5),
+    }
+    outputs["z_t"] = torch.randn(6, 7)
+    outputs["z_a"] = torch.randn(6, 7)
+    outputs["z_v"] = torch.randn(6, 7)
+    align_loss = unconditional_alignment_loss(outputs, pair_mode="text_anchor")
+    changed_z = dict(outputs)
+    changed_z["z_t"] = outputs["z_t"] * 13.0
+    changed_z["z_a"] = outputs["z_a"] * -5.0
+    changed_z["z_v"] = outputs["z_v"] + 9.0
+    changed_align_loss = unconditional_alignment_loss(changed_z, pair_mode="text_anchor")
+    if not torch.allclose(align_loss, changed_align_loss):
+        raise AssertionError("UncondAlign must use h_* hidden states, not z_* projections.")
+    infonce_loss = unconditional_infonce_loss(outputs, temperature=0.1, pair_mode="text_anchor")
+    changed_infonce_loss = unconditional_infonce_loss(
+        changed_z,
+        temperature=0.1,
+        pair_mode="text_anchor",
+    )
+    if torch.allclose(infonce_loss, changed_infonce_loss):
+        raise AssertionError("UncondInfoNCE must use z_* projections when they are present.")
+
+
 def main() -> int:
+    check_projection_loss_boundary()
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         data_dir = root / "mosi"
@@ -83,6 +117,8 @@ def main() -> int:
             "0.01",
             "--pair_mode",
             "text_anchor",
+            "--relation_split",
+            "balanced_within_d",
             "--disagreement_metric",
             "kernel_mmd",
             "--kernel_max_class_samples",
@@ -109,18 +145,27 @@ def main() -> int:
             "high_d_reliability_delta.csv",
             "relation_state_metrics.csv",
             "relation_state_delta.csv",
+            "relation_state_distribution_calibration.csv",
+            "uncond_align_relation_delta.csv",
             "direct_add_alpha_sweep_valid.csv",
             "direct_add_alpha_test_delta_metrics.csv",
             "direct_add_delta_metrics.csv",
             "direct_add_relation_state_delta.csv",
+            "balanced_direct_add_alpha_sweep_valid.csv",
+            "balanced_direct_add_alpha_test_delta_metrics.csv",
+            "balanced_direct_add_delta_metrics.csv",
+            "balanced_direct_add_relation_state_delta.csv",
+            "balanced_direct_add_model.pt",
             "infonce_lambda_sweep_valid.csv",
             "infonce_lambda_test_delta_metrics.csv",
             "infonce_delta_metrics.csv",
             "infonce_high_d_reliability_delta.csv",
             "infonce_lambda_high_d_reliability_delta.csv",
             "infonce_relation_state_delta.csv",
+            "infonce_relation_delta.csv",
             "concat_aware_motivation.csv",
             "residual_discriminative_probe.csv",
+            "residual_probe_by_mode.csv",
             "lambda_test_delta_metrics.csv",
             "lambda_high_d_reliability_delta.csv",
             "delta_macro_f1.png",
@@ -155,6 +200,8 @@ def main() -> int:
             "pair_mode",
             "disagreement_pair_mode",
             "kernel_pair_mode",
+            "label_mode",
+            "relation_split",
         }
         missing_columns = sorted(required_columns - set(groups.columns))
         if missing_columns:
@@ -187,6 +234,16 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
+        infonce_projection_columns = {"use_nce_projection", "nce_proj_dim"}
+        missing_infonce_projection = sorted(
+            infonce_projection_columns - set(infonce_sweep.columns)
+        )
+        if missing_infonce_projection:
+            print(
+                f"Smoke test failed: missing InfoNCE projection columns {missing_infonce_projection}",
+                file=sys.stderr,
+            )
+            return 1
         align_sweep = pd.read_csv(latest / "lambda_sweep_valid.csv")
         if align_sweep.empty or set(align_sweep["align_pair_mode"]) != {"text_anchor"}:
             print(
@@ -200,6 +257,17 @@ def main() -> int:
                 "Smoke test failed: DirectAdd sweep is empty or has wrong pair mode.",
                 file=sys.stderr,
             )
+            return 1
+        balanced_sweep = pd.read_csv(latest / "balanced_direct_add_alpha_sweep_valid.csv")
+        if balanced_sweep.empty or set(balanced_sweep["direct_add_pair_mode"]) != {"balanced"}:
+            print(
+                "Smoke test failed: BalancedDirectAdd sweep is empty or has wrong mode.",
+                file=sys.stderr,
+            )
+            return 1
+        group_metrics = pd.read_csv(latest / "group_metrics.csv")
+        if "BalancedDirectAdd" not in set(group_metrics["method"]):
+            print("Smoke test failed: BalancedDirectAdd method row is missing.", file=sys.stderr)
             return 1
         residual_probe = pd.read_csv(latest / "residual_discriminative_probe.csv")
         residual_columns = {
@@ -218,6 +286,49 @@ def main() -> int:
                 f"Smoke test failed: missing text-anchor residual columns {missing_residual}",
                 file=sys.stderr,
             )
+            return 1
+        calibration = pd.read_csv(latest / "relation_state_distribution_calibration.csv")
+        calibration_columns = {
+            "group",
+            "n",
+            "label_mode",
+            "relation_split",
+            "text_acc",
+            "audio_acc",
+            "vision_acc",
+            "fusion_acc",
+            "avg_R",
+        }
+        missing_calibration = sorted(calibration_columns - set(calibration.columns))
+        if missing_calibration:
+            print(
+                f"Smoke test failed: missing calibration columns {missing_calibration}",
+                file=sys.stderr,
+            )
+            return 1
+        residual_by_mode = pd.read_csv(latest / "residual_probe_by_mode.csv")
+        if residual_by_mode.empty or not {"abs", "signed", "prod", "all"}.issubset(
+            set(residual_by_mode["residual_mode"])
+        ):
+            print("Smoke test failed: residual by-mode table is incomplete.", file=sys.stderr)
+            return 1
+        binary_command = [
+            *command,
+            "--label_mode",
+            "binary",
+        ]
+        binary_result = subprocess.run(binary_command, text=True, capture_output=True)
+        print(binary_result.stdout)
+        if binary_result.returncode != 0:
+            print(binary_result.stderr, file=sys.stderr)
+            return binary_result.returncode
+        binary_runs = list((output_root / "mosi").glob("*"))
+        binary_latest = max(binary_runs, key=lambda p: p.stat().st_mtime)
+        binary_calibration = pd.read_csv(
+            binary_latest / "relation_state_distribution_calibration.csv"
+        )
+        if "class_1_ratio" not in binary_calibration.columns:
+            print("Smoke test failed: binary calibration lacks class_1_ratio.", file=sys.stderr)
             return 1
         print(f"Smoke test passed. Outputs checked in {latest}")
         return 0

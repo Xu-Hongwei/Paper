@@ -9,6 +9,13 @@ full CoPA-v5 method. It tests whether cross-modal alignment gains depend on
 the relation state of a sample, and whether reliable disagreement contains a
 diagnostic residual signal.
 
+For a fuller Chinese walkthrough of the motivation, terminology, examples,
+CSV outputs, and code-level caveats, see:
+
+```text
+MOTIVATION_EXPERIMENT_GUIDE.md
+```
+
 Older method notes, full CoPA-v5 details, label-aware diagnostics, prototype
 checks, and appendix-style code snapshots were moved to:
 
@@ -57,13 +64,20 @@ valid_text, valid_vision, valid_audio, valid_label
 test_text, test_vision, test_audio, test_label
 ```
 
-Labels are continuous sentiment scores in `[-3, 3]` and are converted to three
-classes:
+Labels are continuous sentiment scores in `[-3, 3]`. The default
+`--label_mode three_class` keeps the existing three-class protocol:
 
 ```text
 label < -0.5          -> negative
 -0.5 <= label <= 0.5  -> neutral
 label > 0.5           -> positive
+```
+
+For appendix/robustness checks, `--label_mode binary` uses:
+
+```text
+label <= 0 -> negative
+label > 0  -> positive
 ```
 
 ## Primary Motivation Flow
@@ -86,7 +100,7 @@ The clean motivation loop has four parts.
    diagnostic grouping. The default is `eta_unimodal=0.1`.
 
    ```text
-   D_text_anchor -> Low/Mid/High-D
+   D_text_anchor -> Low/Mid/High-D by validation q33/q66
    pair-graph reliability R -> High/Low-R
    ```
 
@@ -99,6 +113,11 @@ The clean motivation loop has four parts.
    In `--pair_mode full_pair`, the audio-vision reliability edge is included
    too.
 
+   The default `--relation_split balanced_within_d` uses validation-only
+   reliability medians inside Low-D and High-D separately. This avoids letting
+   a single global R threshold make RA/UA/RD/ND accidentally sparse. The old
+   global median split remains available as `--relation_split global_r`.
+
    Relation states:
 
    ```text
@@ -110,27 +129,40 @@ The clean motivation loop has four parts.
 
 2. Unconditional alignment sensitivity
 
-   Compare the supervised Concat baseline with:
+   The main motivation table compares the supervised Concat baseline with:
 
    ```text
    UncondAlign
-   DirectAdd
    Uncond InfoNCE
    ```
 
-   All pair-based components use the same pair graph in a run. The primary v5
-   setting is `--pair_mode text_anchor`, so diagnostics, UncondAlign, DirectAdd,
-   and InfoNCE all use `T-A/T-V`. The appendix counterpart is
+   InfoNCE uses projection heads by default:
+
+   ```text
+   z_m = P_m(h_m)
+   ```
+
+   Classification heads still consume `h_m`; the InfoNCE loss consumes
+   `z_text`, `z_audio`, and `z_vision`. This keeps the contrastive auxiliary
+   loss from being interpreted as directly acting on the classifier hidden
+   states. The default is `--use_nce_projection --nce_proj_dim 128`.
+
+   All alignment/contrastive components use the same pair graph in a run. The primary v5
+   setting is `--pair_mode text_anchor`, so diagnostics, UncondAlign and
+   InfoNCE all use `T-A/T-V`. The appendix counterpart is
    `--pair_mode full_pair`, where all of them include `A-V` as well. The
    intended conclusion is conservative:
-
-   Under `text_anchor`, DirectAdd keeps text fixed and adds text information to
-   audio and vision only. Under `full_pair`, it uses the three-modality mean as
-   the full-pair counterpart.
 
    ```text
    unconditional alignment gains are relation-dependent
    ```
+
+   DirectAdd remains implemented for compatibility and appendix diagnostics.
+   Under `text_anchor` it is reported as `TextInject`, because it keeps text
+   fixed and injects text information into audio and vision rather than acting
+   as a plain alignment objective. A separate appendix baseline,
+   `BalancedDirectAdd`, LayerNorms the three hidden states, averages them, and
+   adds the same averaged vector to all modalities.
 
 3. Selective agreement evidence
 
@@ -141,7 +173,7 @@ The clean motivation loop has four parts.
    reliable agreement is a better alignment-positive signal than Low-D alone
    ```
 
-4. Text-anchor residual probe
+4. Supplementary residual probe
 
    Use label-free diagnostic features from the reference model, not
    method-trained residual heads or true-label class means. Hidden states are
@@ -152,7 +184,10 @@ The clean motivation loop has four parts.
    |h_text - h_vision|
    ```
 
-   The main evidence is:
+   Residual probe is supplementary, not the main claim. It can be run with
+   residual modes `abs`, `signed`, `prod`, and `all`; each mode reports matched
+   residual, label-shuffled residual, and sample-shuffled residual controls.
+   The cautious evidence is:
 
    ```text
    common+residual > common-only
@@ -168,13 +203,13 @@ The clean motivation loop has four parts.
 Single seed:
 
 ```powershell
-python -B code\disagreement_phenomenon\scripts\run_phenomenon.py --dataset mosi --data_root E:\Xu\data\MultiBench --seed 1 --epochs 25 --patience 6 --run_infonce --pair_mode text_anchor --deterministic
+python -B code\disagreement_phenomenon\scripts\run_phenomenon.py --dataset mosi --data_root E:\Xu\data\MultiBench --seed 1 --epochs 25 --patience 6 --run_infonce --pair_mode text_anchor --relation_split balanced_within_d --deterministic
 ```
 
 MOSEI multi-seed:
 
 ```powershell
-python -B code\disagreement_phenomenon\scripts\run_multi_seed.py --dataset mosei --data_root E:\Xu\data\MultiBench --seeds 1 2 3 4 5 --batch_size 1024 --num_workers 0 --epochs 25 --patience 6 --quiet --run_infonce --pair_mode text_anchor --deterministic
+python -B code\disagreement_phenomenon\scripts\run_multi_seed.py --dataset mosei --data_root E:\Xu\data\MultiBench --seeds 1 2 3 4 5 --batch_size 1024 --num_workers 0 --epochs 25 --patience 6 --quiet --run_infonce --pair_mode text_anchor --relation_split balanced_within_d --deterministic
 ```
 
 The primary v5 pair graph is:
@@ -196,8 +231,12 @@ Kernel-MMD grouping also remains available as a backup diagnostic:
 ```
 
 The older specific flags `--nce_pair_mode`, `--disagreement_pair_mode`,
-`--kernel_pair_mode`, `--align_pair_mode`, and `--direct_add_pair_mode` are kept
-for compatibility, but they must match the unified `--pair_mode` when provided.
+`--kernel_pair_mode`, and `--align_pair_mode` are kept for compatibility, but
+they must match the unified `--pair_mode` when provided. `--direct_add_pair_mode`
+only selects the primary DirectAdd/TextInject appendix mode (`text_anchor` or
+`full_pair`). `BalancedDirectAdd` is always trained and reported as a separate
+appendix baseline with `direct_add_pair_mode=balanced`, so it cannot be
+accidentally used as the primary DirectAdd run.
 
 ## Primary Outputs
 
@@ -211,9 +250,14 @@ lambda_test_delta_metrics.csv
 high_d_reliability_delta.csv
 relation_state_metrics.csv
 relation_state_delta.csv
+relation_state_distribution_calibration.csv
+uncond_align_relation_delta.csv
 direct_add_delta_metrics.csv
 direct_add_relation_state_delta.csv
+balanced_direct_add_delta_metrics.csv
+balanced_direct_add_relation_state_delta.csv
 residual_discriminative_probe.csv
+residual_probe_by_mode.csv
 concat_aware_motivation.csv
 ```
 
@@ -225,6 +269,7 @@ infonce_lambda_sweep_valid.csv
 infonce_lambda_test_delta_metrics.csv
 infonce_high_d_reliability_delta.csv
 infonce_relation_state_delta.csv
+infonce_relation_delta.csv
 ```
 
 Multi-seed primary files:
@@ -233,9 +278,14 @@ Multi-seed primary files:
 multi_seed_delta_summary.csv
 error_control_report.csv
 relation_state_delta_summary.csv
+relation_state_distribution_calibration_summary.csv
+uncond_align_relation_delta_summary.csv
 direct_add_delta_summary.csv
 direct_add_relation_state_delta_summary.csv
+balanced_direct_add_delta_summary.csv
+balanced_direct_add_relation_state_delta_summary.csv
 residual_discriminative_probe_summary.csv
+residual_probe_by_mode_summary.csv
 concat_aware_motivation_summary.csv
 ```
 
@@ -245,6 +295,7 @@ When `--run_infonce` is used:
 infonce_delta_summary.csv
 infonce_high_d_reliability_summary.csv
 infonce_relation_state_delta_summary.csv
+infonce_relation_delta_summary.csv
 infonce_lambda_test_delta_summary.csv
 ```
 
