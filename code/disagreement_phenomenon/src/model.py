@@ -78,6 +78,29 @@ class ProjectionHead(nn.Module):
         return self.net(x)
 
 
+class ModalityRouter(nn.Module):
+    """EMOE-style 样本级模态权重路由器。
+
+    输入拼接后的三模态隐层表示，输出每个样本的 text/vision/audio 权重。
+    """
+
+    def __init__(self, input_dim: int, num_modalities: int = 3, temperature: float = 0.1) -> None:
+        super().__init__()
+        if temperature <= 0:
+            raise ValueError("router temperature must be positive.")
+        hidden_dim = max(input_dim // 8, num_modalities)
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, num_modalities),
+        )
+        self.temperature = temperature
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        logits = self.net(x) / self.temperature
+        return torch.softmax(logits, dim=-1)
+
+
 class MultimodalClassifier(nn.Module):
     """多模态分类器：三模态独立编码 + 可选直接对齐注入 + 融合分类头。
 
@@ -100,6 +123,8 @@ class MultimodalClassifier(nn.Module):
         direct_add_pair_mode: str = "text_anchor",
         use_nce_projection: bool = True,
         nce_proj_dim: int = 128,
+        use_dynamic_fusion: bool = False,
+        dynamic_router_temperature: float = 0.1,
     ) -> None:
         """初始化多模态分类器。
 
@@ -117,6 +142,8 @@ class MultimodalClassifier(nn.Module):
                 "balanced" 三模态经 LayerNorm 后平均再注入。
             use_nce_projection: 是否使用 InfoNCE 投影头。
             nce_proj_dim: InfoNCE 投影维度。
+            use_dynamic_fusion: 是否使用 EMOE-style 样本级动态模态加权融合。
+            dynamic_router_temperature: 动态融合 router 的 softmax 温度。
 
         Raises:
             ValueError: direct_add_pair_mode 不合法时抛出。
@@ -129,6 +156,7 @@ class MultimodalClassifier(nn.Module):
         self.direct_add_alpha = direct_add_alpha
         self.direct_add_pair_mode = direct_add_pair_mode
         self.use_nce_projection = use_nce_projection
+        self.use_dynamic_fusion = use_dynamic_fusion
         self.text_encoder = ModalityEncoder(text_dim, hidden_dim, dropout)
         self.vision_encoder = ModalityEncoder(vision_dim, hidden_dim, dropout)
         self.audio_encoder = ModalityEncoder(audio_dim, hidden_dim, dropout)
@@ -148,6 +176,14 @@ class MultimodalClassifier(nn.Module):
         self.text_head = nn.Linear(hidden_dim, num_classes)
         self.vision_head = nn.Linear(hidden_dim, num_classes)
         self.audio_head = nn.Linear(hidden_dim, num_classes)
+        if use_dynamic_fusion:
+            self.modality_router = ModalityRouter(
+                hidden_dim * 3,
+                num_modalities=3,
+                temperature=dynamic_router_temperature,
+            )
+        else:
+            self.modality_router = None
         self.fusion_head = nn.Sequential(
             nn.Linear(hidden_dim * 3, hidden_dim),
             nn.ReLU(),
@@ -183,6 +219,7 @@ class MultimodalClassifier(nn.Module):
             - z_t/z_v/z_a: InfoNCE 投影特征 [B, proj_dim]
             - logits_t/logits_v/logits_a: 单模态分类 logits [B, num_classes]
             - logits_f: 融合分类 logits [B, num_classes]
+            - channel_weight: 可选，DynamicFusion 的样本级 text/vision/audio 权重
         """
         enc = self.encode(batch)
         fuse_text = enc["text"]
@@ -206,8 +243,15 @@ class MultimodalClassifier(nn.Module):
                 fuse_text = fuse_text + self.direct_add_alpha * aligned
                 fuse_vision = fuse_vision + self.direct_add_alpha * aligned
                 fuse_audio = fuse_audio + self.direct_add_alpha * aligned
+        channel_weight = None
+        if self.modality_router is not None:
+            router_input = torch.cat([enc["text"], enc["vision"], enc["audio"]], dim=-1)
+            channel_weight = self.modality_router(router_input)
+            fuse_text = fuse_text * channel_weight[:, 0:1]
+            fuse_vision = fuse_vision * channel_weight[:, 1:2]
+            fuse_audio = fuse_audio * channel_weight[:, 2:3]
         fused = torch.cat([fuse_text, fuse_vision, fuse_audio], dim=-1)
-        return {
+        result = {
             "h_t": enc["text"],
             "h_v": enc["vision"],
             "h_a": enc["audio"],
@@ -219,6 +263,9 @@ class MultimodalClassifier(nn.Module):
             "logits_a": self.audio_head(enc["audio"]),
             "logits_f": self.fusion_head(fused),
         }
+        if channel_weight is not None:
+            result["channel_weight"] = channel_weight
+        return result
 
 
 def unconditional_alignment_loss(

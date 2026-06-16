@@ -91,6 +91,9 @@ def main() -> int:
             "kernel_mmd",
             "--kernel_max_class_samples",
             "32",
+            "--run_kernel_dist_diagnostic",
+            "--kernel_dist_min_group_size",
+            "4",
             "--patience",
             "1",
         ]
@@ -126,6 +129,9 @@ def main() -> int:
             "relation_state_metrics_summary.csv",
             "relation_state_distribution_calibration_all.csv",
             "relation_state_distribution_calibration_summary.csv",
+            "kernel_distribution_relation_metrics_all.csv",
+            "kernel_distribution_relation_summary_all.csv",
+            "kernel_distribution_relation_summary.csv",
             "direct_add_relation_state_delta_all.csv",
             "direct_add_relation_state_delta_summary.csv",
             "balanced_direct_add_relation_state_delta_all.csv",
@@ -238,6 +244,29 @@ def main() -> int:
         if missing_calibration:
             print(
                 f"Multi-seed smoke test failed: missing calibration summary columns {missing_calibration}",
+                file=sys.stderr,
+            )
+            return 1
+        kernel_summary = pd.read_csv(summary / "kernel_distribution_relation_summary.csv")
+        kernel_columns = {
+            "D_dist_text_anchor_mean",
+            "D_dist_full_pair_mean",
+            "mmd_ta_mean",
+            "mmd_tv_mean",
+            "avg_R_mean",
+            "avg_D_sample_mean",
+        }
+        missing_kernel = sorted(kernel_columns - set(kernel_summary.columns))
+        if missing_kernel:
+            print(
+                f"Multi-seed smoke test failed: missing kernel distribution columns {missing_kernel}",
+                file=sys.stderr,
+            )
+            return 1
+        kernel_all = pd.read_csv(summary / "kernel_distribution_relation_summary_all.csv")
+        if kernel_all.empty or set(kernel_all["pair_mode"]) != {"text_anchor"}:
+            print(
+                "Multi-seed smoke test failed: kernel distribution all-seed pair mode is wrong.",
                 file=sys.stderr,
             )
             return 1

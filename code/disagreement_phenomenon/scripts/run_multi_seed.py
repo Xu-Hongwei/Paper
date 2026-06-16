@@ -104,6 +104,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--nce_proj_dim", type=int, default=128)
     parser.add_argument(
+        "--run_dynamic_fusion",
+        action="store_true",
+        help="Train and aggregate EMOE-style DynamicFusion baselines.",
+    )
+    parser.add_argument(
+        "--lambda_dynamic_weight_values",
+        type=float,
+        nargs="+",
+        default=[0.01, 0.05, 0.1, 0.5],
+    )
+    parser.add_argument("--dynamic_router_temperature", type=float, default=0.1)
+    parser.add_argument("--dynamic_weight_epsilon", type=float, default=1e-4)
+    parser.add_argument(
         "--nce_pair_mode",
         choices=("text_anchor", "full_pair"),
         default=None,
@@ -129,6 +142,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--kernel_class_weight", type=float, default=0.5)
     parser.add_argument("--kernel_max_class_samples", type=int, default=1024)
+    parser.add_argument(
+        "--run_kernel_dist_diagnostic",
+        action="store_true",
+        help="Aggregate prediction-class conditional batch MMD relation diagnostics.",
+    )
+    parser.add_argument(
+        "--kernel_dist_min_group_size",
+        type=int,
+        default=10,
+        help="Minimum predicted-class/relation-state batch size for kernel distribution MMD.",
+    )
     parser.add_argument(
         "--relation_split",
         choices=("balanced_within_d", "global_r"),
@@ -454,6 +478,14 @@ def run_one_seed(args: argparse.Namespace, run_root: Path, seed: int, seen: set[
     ]
     if args.deterministic:
         command.append("--deterministic")
+    if args.run_kernel_dist_diagnostic:
+        command.extend(
+            [
+                "--run_kernel_dist_diagnostic",
+                "--kernel_dist_min_group_size",
+                str(args.kernel_dist_min_group_size),
+            ]
+        )
     if args.run_infonce:
         command.extend(
             [
@@ -469,6 +501,18 @@ def run_one_seed(args: argparse.Namespace, run_root: Path, seed: int, seen: set[
                 str(args.nce_proj_dim),
                 "--nce_pair_mode",
                 args.nce_pair_mode,
+            ]
+        )
+    if args.run_dynamic_fusion:
+        command.extend(
+            [
+                "--run_dynamic_fusion",
+                "--lambda_dynamic_weight_values",
+                *[str(value) for value in args.lambda_dynamic_weight_values],
+                "--dynamic_router_temperature",
+                str(args.dynamic_router_temperature),
+                "--dynamic_weight_epsilon",
+                str(args.dynamic_weight_epsilon),
             ]
         )
     if args.quiet:
@@ -516,12 +560,18 @@ def main() -> int:
             "nce_pair_mode": args.nce_pair_mode,
             "use_nce_projection": args.use_nce_projection,
             "nce_proj_dim": args.nce_proj_dim,
+            "run_dynamic_fusion": args.run_dynamic_fusion,
+            "lambda_dynamic_weight_values": args.lambda_dynamic_weight_values,
+            "dynamic_router_temperature": args.dynamic_router_temperature,
+            "dynamic_weight_epsilon": args.dynamic_weight_epsilon,
             "disagreement_metric": args.disagreement_metric,
             "disagreement_pair_mode": args.disagreement_pair_mode,
             "kernel_bandwidth": args.kernel_bandwidth,
             "kernel_pair_mode": args.kernel_pair_mode,
             "kernel_class_weight": args.kernel_class_weight,
             "kernel_max_class_samples": args.kernel_max_class_samples,
+            "run_kernel_dist_diagnostic": args.run_kernel_dist_diagnostic,
+            "kernel_dist_min_group_size": args.kernel_dist_min_group_size,
             "relation_split": args.relation_split,
             "residual_modes": args.residual_modes,
             "tau_agreement": args.tau_agreement,
@@ -569,6 +619,17 @@ def main() -> int:
     residual_probe_all = read_seed_csv(run_dirs, "residual_discriminative_probe.csv")
     residual_probe_by_mode_all = read_seed_csv(run_dirs, "residual_probe_by_mode.csv")
     calibration_all = read_seed_csv(run_dirs, "relation_state_distribution_calibration.csv")
+    kernel_distribution_metrics_all = pd.DataFrame()
+    kernel_distribution_summary_all = pd.DataFrame()
+    if args.run_kernel_dist_diagnostic:
+        kernel_distribution_metrics_all = read_seed_csv(
+            run_dirs,
+            "kernel_distribution_relation_metrics.csv",
+        )
+        kernel_distribution_summary_all = read_seed_csv(
+            run_dirs,
+            "kernel_distribution_relation_summary.csv",
+        )
     lambda_delta_all = read_seed_csv(run_dirs, "lambda_test_delta_metrics.csv")
     lambda_reliability_delta_all = read_seed_csv(
         run_dirs,
@@ -579,6 +640,10 @@ def main() -> int:
     infonce_relation_state_delta_all = pd.DataFrame()
     infonce_lambda_delta_all = pd.DataFrame()
     infonce_lambda_reliability_delta_all = pd.DataFrame()
+    dynamic_fusion_delta_all = pd.DataFrame()
+    dynamic_fusion_relation_state_delta_all = pd.DataFrame()
+    dynamic_fusion_lambda_delta_all = pd.DataFrame()
+    dynamic_fusion_weight_relation_all = pd.DataFrame()
     if args.run_infonce:
         infonce_delta_all = read_seed_csv(run_dirs, "infonce_delta_metrics.csv")
         infonce_reliability_delta_all = read_seed_csv(
@@ -596,6 +661,23 @@ def main() -> int:
         infonce_lambda_reliability_delta_all = read_seed_csv(
             run_dirs,
             "infonce_lambda_high_d_reliability_delta.csv",
+        )
+    if args.run_dynamic_fusion:
+        dynamic_fusion_delta_all = read_seed_csv(
+            run_dirs,
+            "dynamic_fusion_delta_metrics.csv",
+        )
+        dynamic_fusion_relation_state_delta_all = read_seed_csv(
+            run_dirs,
+            "dynamic_fusion_relation_state_delta.csv",
+        )
+        dynamic_fusion_lambda_delta_all = read_seed_csv(
+            run_dirs,
+            "dynamic_fusion_lambda_test_delta_metrics.csv",
+        )
+        dynamic_fusion_weight_relation_all = read_seed_csv(
+            run_dirs,
+            "dynamic_fusion_weight_relation_summary.csv",
         )
     delta_all.to_csv(summary_dir / "multi_seed_delta_all.csv", index=False, encoding="utf-8-sig")
     group_all.to_csv(
@@ -678,6 +760,17 @@ def main() -> int:
         index=False,
         encoding="utf-8-sig",
     )
+    if args.run_kernel_dist_diagnostic:
+        kernel_distribution_metrics_all.to_csv(
+            summary_dir / "kernel_distribution_relation_metrics_all.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        kernel_distribution_summary_all.to_csv(
+            summary_dir / "kernel_distribution_relation_summary_all.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
     lambda_delta_all.to_csv(
         summary_dir / "lambda_test_delta_all.csv",
         index=False,
@@ -716,6 +809,27 @@ def main() -> int:
         )
         infonce_lambda_reliability_delta_all.to_csv(
             summary_dir / "infonce_lambda_high_d_reliability_delta_all.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+    if args.run_dynamic_fusion:
+        dynamic_fusion_delta_all.to_csv(
+            summary_dir / "dynamic_fusion_delta_all.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        dynamic_fusion_relation_state_delta_all.to_csv(
+            summary_dir / "dynamic_fusion_relation_state_delta_all.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        dynamic_fusion_lambda_delta_all.to_csv(
+            summary_dir / "dynamic_fusion_lambda_test_delta_all.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        dynamic_fusion_weight_relation_all.to_csv(
+            summary_dir / "dynamic_fusion_weight_relation_all.csv",
             index=False,
             encoding="utf-8-sig",
         )
@@ -801,6 +915,53 @@ def main() -> int:
         min_count=args.error_min_seeds,
         sign_rate_threshold=args.error_sign_rate,
     )
+    dynamic_fusion_delta_summary = pd.DataFrame()
+    dynamic_fusion_relation_state_summary = pd.DataFrame()
+    dynamic_fusion_lambda_delta_summary = pd.DataFrame()
+    dynamic_fusion_weight_relation_summary = pd.DataFrame()
+    if args.run_dynamic_fusion:
+        dynamic_fusion_delta_summary = flatten_summary(
+            dynamic_fusion_delta_all,
+            ["group"],
+            ["delta_acc", "delta_macro_f1", "lambda_dynamic_weight"],
+            sign_cols=["delta_acc", "delta_macro_f1"],
+            min_count=args.error_min_seeds,
+            sign_rate_threshold=args.error_sign_rate,
+        )
+        dynamic_fusion_relation_state_summary = flatten_summary(
+            dynamic_fusion_relation_state_delta_all,
+            ["group"],
+            ["delta_acc", "delta_macro_f1", "lambda_dynamic_weight"],
+            sign_cols=["delta_acc", "delta_macro_f1"],
+            min_count=args.error_min_seeds,
+            sign_rate_threshold=args.error_sign_rate,
+        )
+        dynamic_fusion_lambda_delta_summary = flatten_summary(
+            dynamic_fusion_lambda_delta_all,
+            ["lambda_dynamic_weight", "group"],
+            [
+                "delta_acc",
+                "delta_macro_f1",
+                "valid_macro_f1",
+                "valid_acc",
+                "dynamic_router_temperature",
+            ],
+            sign_cols=["delta_acc", "delta_macro_f1"],
+            min_count=args.error_min_seeds,
+            sign_rate_threshold=args.error_sign_rate,
+        )
+        dynamic_fusion_weight_relation_summary = flatten_summary(
+            dynamic_fusion_weight_relation_all,
+            ["group"],
+            numeric_value_columns(
+                dynamic_fusion_weight_relation_all,
+                {
+                    "seed",
+                    "run_dir",
+                    "group",
+                },
+            ),
+        )
     concat_aware_summary = flatten_summary(
         concat_aware_all,
         ["group"],
@@ -809,6 +970,7 @@ def main() -> int:
             "uncond_align_macro_f1",
             "direct_add_macro_f1",
             "balanced_direct_add_macro_f1",
+            "dynamic_fusion_macro_f1",
             "infonce_macro_f1",
             "soft_split_probe_macro_f1",
             "text_anchor_probe_macro_f1",
@@ -823,6 +985,8 @@ def main() -> int:
             "lambda_align",
             "direct_add_alpha",
             "balanced_direct_add_alpha",
+            "lambda_dynamic_weight",
+            "dynamic_router_temperature",
             "lambda_nce",
         ],
     )
@@ -876,6 +1040,23 @@ def main() -> int:
             },
         ),
     )
+    kernel_distribution_summary = pd.DataFrame()
+    if args.run_kernel_dist_diagnostic:
+        kernel_distribution_summary = flatten_summary(
+            kernel_distribution_summary_all,
+            ["split", "group", "pair_mode"],
+            numeric_value_columns(
+                kernel_distribution_summary_all,
+                {
+                    "seed",
+                    "run_dir",
+                    "split",
+                    "group",
+                    "relation_state_desc",
+                    "pair_mode",
+                },
+            ),
+        )
     lambda_delta_summary = flatten_summary(
         lambda_delta_all,
         ["lambda_align", "group"],
@@ -1030,6 +1211,12 @@ def main() -> int:
         index=False,
         encoding="utf-8-sig",
     )
+    if args.run_kernel_dist_diagnostic:
+        kernel_distribution_summary.to_csv(
+            summary_dir / "kernel_distribution_relation_summary.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
     lambda_delta_summary.to_csv(
         summary_dir / "lambda_test_delta_summary.csv",
         index=False,
@@ -1071,6 +1258,27 @@ def main() -> int:
             index=False,
             encoding="utf-8-sig",
         )
+    if args.run_dynamic_fusion:
+        dynamic_fusion_delta_summary.to_csv(
+            summary_dir / "dynamic_fusion_delta_summary.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        dynamic_fusion_relation_state_summary.to_csv(
+            summary_dir / "dynamic_fusion_relation_state_delta_summary.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        dynamic_fusion_lambda_delta_summary.to_csv(
+            summary_dir / "dynamic_fusion_lambda_test_delta_summary.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        dynamic_fusion_weight_relation_summary.to_csv(
+            summary_dir / "dynamic_fusion_weight_relation_summary.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
     error_frames: list[tuple[str, pd.DataFrame, list[str]]] = [
         ("uncond_align_delta", delta_summary, ["group"]),
         ("uncond_align_high_d_reliability", reliability_summary, ["group"]),
@@ -1101,6 +1309,22 @@ def main() -> int:
                     "lambda_nce_high_d_reliability",
                     infonce_lambda_reliability_summary,
                     ["lambda_nce", "group"],
+                ),
+            ]
+        )
+    if args.run_dynamic_fusion:
+        error_frames.extend(
+            [
+                ("dynamic_fusion_delta", dynamic_fusion_delta_summary, ["group"]),
+                (
+                    "dynamic_fusion_relation_state",
+                    dynamic_fusion_relation_state_summary,
+                    ["group"],
+                ),
+                (
+                    "lambda_dynamic_weight_strength",
+                    dynamic_fusion_lambda_delta_summary,
+                    ["lambda_dynamic_weight", "group"],
                 ),
             ]
         )
@@ -1162,6 +1386,32 @@ def main() -> int:
         direct_add_label: direct_add_relation_state_summary,
         "BalancedDirectAdd": balanced_direct_add_relation_state_summary,
     }
+    if args.run_dynamic_fusion:
+        save_detailed_delta_plot(
+            dynamic_fusion_delta_all,
+            dynamic_fusion_delta_summary,
+            summary_dir / "dynamic_fusion_delta_macro_f1_detailed.png",
+            title="DynamicFusion gain by disagreement group",
+            ylabel="Delta Macro-F1 (DynamicFusion - Concat)",
+        )
+        save_detailed_delta_plot(
+            dynamic_fusion_relation_state_delta_all,
+            dynamic_fusion_relation_state_summary,
+            summary_dir / "dynamic_fusion_relation_state_delta_detailed.png",
+            group_order=RELATION_STATE_GROUP_ORDER,
+            title="DynamicFusion by relation state",
+            ylabel="Delta Macro-F1 (DynamicFusion - Concat)",
+        )
+        save_lambda_curve_plot(
+            dynamic_fusion_lambda_delta_summary,
+            summary_dir / "dynamic_fusion_lambda_delta_macro_f1_curve.png",
+            title="Multi-seed DynamicFusion weight strength curve",
+            x_col="lambda_dynamic_weight",
+            x_label="lambda_dynamic_weight",
+            y_label="Delta Macro-F1 (DynamicFusion - Concat)",
+            raw_frame=dynamic_fusion_lambda_delta_all,
+        )
+        heatmap_summaries["DynamicFusion"] = dynamic_fusion_relation_state_summary
     if args.run_infonce:
         save_detailed_delta_plot(
             infonce_delta_all,
@@ -1208,8 +1458,16 @@ def main() -> int:
     print(reliability_summary.to_string(index=False))
     print("\nRelation-state summary:")
     print(relation_state_summary.to_string(index=False))
+    if args.run_dynamic_fusion:
+        print("\nDynamicFusion relation-state summary:")
+        print(dynamic_fusion_relation_state_summary.to_string(index=False))
+        print("\nDynamicFusion weight relation summary:")
+        print(dynamic_fusion_weight_relation_summary.to_string(index=False))
     print("\nRelation-state distribution/calibration summary:")
     print(calibration_summary.to_string(index=False))
+    if args.run_kernel_dist_diagnostic:
+        print("\nKernel distribution relation summary:")
+        print(kernel_distribution_summary.to_string(index=False))
     print("\nDirectAdd relation-state summary:")
     print(direct_add_relation_state_summary.to_string(index=False))
     print("\nBalancedDirectAdd relation-state summary:")

@@ -1,6 +1,6 @@
 # CoPA version5：实验设计与执行路线
 
-> 实验目标：验证 **relation-gated contrastive learning** 是否比 Concat、无条件对齐、DirectAdd 和普通 InfoNCE 更适合监督式多模态融合。  
+> 实验目标：先验证 **relation-state-dependent alignment evidence**，再验证 relation-gated contrastive learning 是否比 Concat、无条件对齐和普通 pairwise InfoNCE 更适合监督式多模态融合。
 > 核心问题：**预测分布只作为 relation gate 是否足够？InfoNCE 是否能真正学习 RA 的公共语义和 RD 的判别性残差？**
 
 ---
@@ -19,13 +19,21 @@ v5 的方法从：
 \text{prediction-based relation gate} + \text{relation-gated contrastive learning}
 \]
 
-因此实验必须回答五个问题：
+当前代码阶段先不直接实现完整 CoPA-v5，而是先完成 **motivation evidence loop**。因此实验问题分成两层。
 
-1. 无条件对齐、DirectAdd、普通 InfoNCE 是否仍然在 High-D / RD 上不稳定？
-2. RA-gated common InfoNCE 是否比普通 same-sample InfoNCE 更稳？
-3. RD residual InfoNCE 是否能证明 reliable disagreement 具有判别价值？
-4. relation gate 是否真的有用，而不是随机分组也能达到同样效果？
-5. CoPA-v5 是否在 overall 和 relation-state subgroup 上优于 v4 / baseline？
+第一层，当前已实现/优先验证：
+
+1. 无条件对齐、普通 pairwise InfoNCE 是否仍然在 High-D / RD 上不稳定？
+2. 普通 pairwise same-sample InfoNCE 是否不能稳定替代 relation-aware 方案？
+3. text-anchor residual 是否有补充诊断价值？
+4. relation-state split 是否可靠、不过度依赖某个全局阈值？
+
+第二层，证据成立后再实现：
+
+5. RA-gated common InfoNCE 是否比普通 same-sample InfoNCE 更稳？
+6. RD residual InfoNCE 是否能证明 reliable disagreement 具有判别价值？
+7. relation gate 是否真的有用，而不是随机分组也能达到同样效果？
+8. CoPA-v5 是否在 overall 和 relation-state subgroup 上优于 baseline？
 
 ---
 
@@ -35,9 +43,9 @@ version5 实验分六个阶段：
 
 | Phase | 目标 | 关键产物 |
 |---|---|---|
-| Phase 0 | 整理现有 20-seed motivation 证据 | 当前 v4 / prototype 版本的证据边界 |
-| Phase 1 | 加入普通 InfoNCE baseline | 判断 same-sample InfoNCE 是否存在 High-D 风险 |
-| Phase 2 | Residual probe | 验证 High-D+High-R residual 是否有判别价值 |
+| Phase 0 | 整理当前 clean motivation evidence loop | 关系分组、校准表、Concat/UncondAlign/UncondInfoNCE 主线 |
+| Phase 1 | 加入 projected pairwise InfoNCE baseline | 判断 same-sample pairwise InfoNCE 是否存在 High-D/RD 风险 |
+| Phase 2 | Residual probe 作为补充诊断 | 检查 High-D+High-R text-anchor residual 是否有判别价值 |
 | Phase 3 | 实现 CoPA-v5 | RA-NCE + RD-NCE 主方法 |
 | Phase 4 | Ablation & error control | 验证每个模块是否必要 |
 | Phase 5 | 扩展数据集和鲁棒性 | MOSI/MOSEI 之外的补充验证 |
@@ -48,7 +56,7 @@ version5 实验分六个阶段：
 \text{Phase 1} \rightarrow \text{Phase 2} \rightarrow \text{Phase 3}
 \]
 
-也就是先确认 InfoNCE baseline 和 residual probe，再全面跑 CoPA-v5。
+也就是先确认 InfoNCE baseline 和 residual probe，再全面跑 CoPA-v5。当前代码已经完成 Phase 0/1/2 的主要框架，尚未实现 Phase 3 的完整 CoPA-v5 主方法。
 
 ---
 
@@ -64,7 +72,7 @@ version5 实验分六个阶段：
 原因：
 
 - 是多模态情感分析主流 benchmark；
-- 已有 Concat / UncondAlign / DirectAdd / CoPA 20-seed 结果；
+- 已有 Concat / UncondAlign / DirectAdd(TextInject) / CoPA prototype 历史结果，可作为背景但不直接进入当前 clean motivation 主线；
 - 便于和 v4 结果连续比较。
 
 ### 2.2 扩展数据集
@@ -82,9 +90,9 @@ version5 实验分六个阶段：
 
 对于 MOSI/MOSEI：
 
-- 主指标可以使用二分类情感标签；
-- 辅助可报告 7-class 或 regression 指标；
-- relation gate 和 InfoNCE 第一版建议使用离散分类标签，减少复杂性。
+- 当前主线使用三分类情感标签，保持与已有动机实验可比；
+- binary 作为 robustness appendix，而不是默认主线；
+- 7-class 或 regression 指标可作为后续补充，不进入第一轮动机主表。
 
 二分类标签：
 
@@ -98,7 +106,17 @@ y=\mathbb{1}(score>0)
 y\in\{negative,neutral,positive\}
 \]
 
-但第一版建议先使用二分类，保证稳定。
+当前第一版代码默认：
+
+```text
+--label_mode three_class
+```
+
+binary 补充实验使用：
+
+```text
+--label_mode binary
+```
 
 ---
 
@@ -170,11 +188,19 @@ p_m^n=\text{Softmax}(C_m(z_m^{c,n}))
 D_{ij}^n=JSD(p_i^n,p_j^n)
 \]
 
-样本级分歧：
+full-pair 样本级分歧：
 
 \[
-D_{pred}^n=rac{1}{3}(D_{ta}^n+D_{tv}^n+D_{av}^n)
+D_{pred}^n=\frac{1}{3}(D_{ta}^n+D_{tv}^n+D_{av}^n)
 \]
+
+当前主线采用 text-anchor 分歧：
+
+\[
+D_{pred}^{ta/tv,n}=\frac{1}{2}(D_{ta}^n+D_{tv}^n)
+\]
+
+原因是当前论文假设 text 作为语义锚点，audio 和 vision 分别向 text 对齐即可；A-V 直接对齐可能引入方向冲突。`full_pair` 保留为 appendix。
 
 ### 4.3 Agreement score
 
@@ -228,53 +254,97 @@ g_{ij}^{dis,n}=Q_i^nQ_j^nB_{ij}^{label,n}(1-A_{ij}^n)
 
 ---
 
-## 5. Phase 0：整理现有 20-seed 证据
+## 5. Phase 0：整理当前 motivation evidence loop
 
 ### 5.1 目的
 
-把现有结果作为 motivation evidence，而不是最终方法证据。
+把当前代码结果作为 motivation evidence，而不是最终方法证据。
+
+当前主线配置：
+
+```text
+three_class + text_anchor + balanced_within_d
+```
+
+reference model 保持 joint training：
+
+\[
+CE_{fusion}+\eta_{uni}\cdot mean(CE_t,CE_a,CE_v)
+\]
+
+默认：
+
+\[
+\eta_{uni}=0.1
+\]
 
 ### 5.2 需要整理的表
 
-#### Table 1：Overall performance
+#### Table 1：Relation-state distribution / calibration
+
+输出：
+
+```text
+relation_state_distribution_calibration.csv
+relation_state_distribution_calibration_summary.csv
+```
+
+需要检查：
+
+| Group | n | class ratio | Text Acc | Audio Acc | Vision Acc | Fusion Acc | Avg R |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| RA |  |  |  |  |  |  |  |
+| UA |  |  |  |  |  |  |  |
+| RD |  |  |  |  |  |  |  |
+| ND |  |  |  |  |  |  |  |
+
+如果 High-R 组 accuracy 不高于 Low-R，则论文里只称：
+
+```text
+confidence-based reliability
+```
+
+不要写成真实可靠性。
+
+#### Table 2：Overall performance
 
 | Method | Macro-F1 | Acc | Delta vs Concat | 95% CI | Error Control |
 |---|---:|---:|---:|---:|---|
 | Concat |  |  |  |  |  |
 | UncondAlign |  |  |  |  |  |
-| DirectAdd |  |  |  |  |  |
-| CoPA-v4 |  |  |  |  |  |
+| UncondInfoNCE |  |  |  |  |  |
 
-#### Table 2：Low/Mid/High-D group delta
+`TextInject` 和 `BalancedDirectAdd` 只放 appendix/diagnostic。
+
+#### Table 3：Low/Mid/High-D group delta
 
 | Method | Low-D | Mid-D | High-D | High-D Error Control |
 |---|---:|---:|---:|---|
 | UncondAlign |  |  |  |  |
-| DirectAdd |  |  |  |  |
-| CoPA-v4 |  |  |  |  |
+| UncondInfoNCE |  |  |  |  |
 
-#### Table 3：Fixed strength analysis
+#### Table 4：Relation-state delta
 
-| Method | Strength | Group | Delta | 95% CI | Positive Rate | Error Control |
-|---|---:|---|---:|---:|---:|---|
-| UncondAlign | \(\lambda\) | High-D |  |  |  |  |
-| DirectAdd | \(\alpha\) | High-D |  |  |  |  |
+| Method | RA | UA | RD | ND | RD Error Control |
+|---|---:|---:|---:|---:|---|
+| UncondAlign |  |  |  |  |  |
+| UncondInfoNCE |  |  |  |  |  |
 
 ### 5.3 预期结论
 
 只能保守写：
 
-> Alignment gain is relation-dependent. Unconditional alignment and direct addition are not uniformly reliable, especially in high-disagreement groups.
+> Alignment gain is relation-dependent. Unconditional alignment and pairwise same-sample InfoNCE are not uniformly reliable, especially in high-disagreement or reliable-disagreement groups.
 
 不要写：
 
-> CoPA-v4 has solved reliable disagreement.
+> CoPA-v5 has solved reliable disagreement.
 
 因为当前 RD 证据还不充分。
 
 ---
 
-## 6. Phase 1：普通 InfoNCE baseline
+## 6. Phase 1：普通 pairwise InfoNCE baseline
 
 ### 6.1 目的
 
@@ -283,6 +353,14 @@ g_{ij}^{dis,n}=Q_i^nQ_j^nB_{ij}^{label,n}(1-A_{ij}^n)
 > 如果使用普通 same-sample InfoNCE，会不会重复无条件对齐的问题？
 
 ### 6.2 Baseline 定义
+
+当前代码中的 `UncondInfoNCE` 更准确地说是：
+
+```text
+UncondPairInfoNCE
+```
+
+它是普通 pairwise same-sample InfoNCE baseline，不是 MMIM-style fusion-to-modality MI maximization。
 
 对模态对 \((i,j)\)：
 
@@ -304,10 +382,17 @@ g_{ij}^{dis,n}=Q_i^nQ_j^nB_{ij}^{label,n}(1-A_{ij}^n)
 =\frac{1}{2}(\mathcal{L}_{i\rightarrow j}^{NCE}+\mathcal{L}_{j\rightarrow i}^{NCE})
 \]
 
-三模态：
+text-anchor 主线：
 
 \[
 \mathcal{L}_{uncond}^{NCE}
+=\frac{1}{2}(\mathcal{L}_{ta}^{NCE}+\mathcal{L}_{tv}^{NCE})
+\]
+
+full-pair appendix：
+
+\[
+\mathcal{L}_{uncond,full}^{NCE}
 =\frac{1}{3}(\mathcal{L}_{ta}^{NCE}+\mathcal{L}_{tv}^{NCE}+\mathcal{L}_{av}^{NCE})
 \]
 
@@ -317,14 +402,28 @@ g_{ij}^{dis,n}=Q_i^nQ_j^nB_{ij}^{label,n}(1-A_{ij}^n)
 \mathcal{L}=\mathcal{L}_{task}+\lambda_{nce}\mathcal{L}_{uncond}^{NCE}
 \]
 
+当前实现默认使用 projection head：
+
+\[
+z_m=P_m(h_m)
+\]
+
+分类仍使用 \(h_m\)，InfoNCE 使用 \(z_m\)，避免直接压缩分类 hidden。
+
 ### 6.3 对照方法
 
 | 方法 | 作用 |
 |---|---|
 | Concat | 基础监督融合 |
 | UncondAlign L2/cosine | 无条件距离拉近 |
-| DirectAdd | 保留原路径 + 直接混入对齐摘要 |
-| Uncond InfoNCE | same-sample positive 对比学习 |
+| UncondInfoNCE | pairwise same-sample positive 对比学习 |
+
+appendix/diagnostic：
+
+| 方法 | 作用 |
+|---|---|
+| TextInject | 原 text-anchor DirectAdd，text 注入 audio/vision，不是公平 alignment baseline |
+| BalancedDirectAdd | 三模态 LayerNorm 后平均再加回三模态，更公平但仍是融合增强 baseline |
 
 ### 6.4 超参数
 
@@ -348,6 +447,8 @@ g_{ij}^{dis,n}=Q_i^nQ_j^nB_{ij}^{label,n}(1-A_{ij}^n)
 \lambda_{nce}
 \]
 
+sweep 中每个候选训练前重置随机种子和 train DataLoader generator，减少候选之间的初始化 / batch shuffle 噪声。
+
 ### 6.5 成功标准
 
 如果普通 InfoNCE 在 High-D 或 RD 上不稳定，说明：
@@ -370,7 +471,7 @@ g_{ij}^{dis,n}=Q_i^nQ_j^nB_{ij}^{label,n}(1-A_{ij}^n)
 
 ### 7.1 目的
 
-证明或证伪：
+补充诊断：
 
 \[
 High\text{-}D+High\text{-}R
@@ -378,7 +479,7 @@ High\text{-}D+High\text{-}R
 
 中的 residual 是否具有判别价值。
 
-这是决定论文能否继续主打 “discriminative disagreement” 的关键。
+Residual probe 不再作为主动机命题，只用于判断能否在后续 CoPA-v5 中继续主打 “discriminative disagreement”。如果 probe 不稳，主线收缩为 relation-aware selective alignment。
 
 ### 7.2 分组方式
 
@@ -407,7 +508,7 @@ R_{sample}^n=\frac{1}{3}(Q_t^n+Q_v^n+Q_a^n)
 z_{common}^n=[z_t^{c,n};z_v^{c,n};z_a^{c,n}]
 \]
 
-残差特征：
+text-anchor 残差特征：
 
 \[
 r_{ta}^n=|z_t^{r,n}-z_a^{r,n}|
@@ -418,14 +519,10 @@ r_{tv}^n=|z_t^{r,n}-z_v^{r,n}|
 \]
 
 \[
-r_{av}^n=|z_a^{r,n}-z_v^{r,n}|
+z_{res}^n=[r_{ta}^n;r_{tv}^n]
 \]
 
-组合残差：
-
-\[
-z_{res}^n=[r_{ta}^n;r_{tv}^n;r_{av}^n]
-\]
+\(r_{av}\) 只作为 diagnostic appendix，不进入 text-anchor 主 probe。
 
 ### 7.4 Probe 模型
 
@@ -442,12 +539,12 @@ z_{res}^n=[r_{ta}^n;r_{tv}^n;r_{av}^n]
 | Common-only | \(z_{common}\) | 公共语义是否足够 |
 | Residual-only | \(z_{res}\) | residual 是否有判别力 |
 | Common+Residual | \([z_{common};z_{res}]\) | residual 是否提供增益 |
-| Shuffled residual | 打乱 residual-label | 负对照 |
-| Random group residual | 随机 High-R / Low-R | 检查分组是否有效 |
+| Label-shuffled residual | 打乱 residual-label | 标签控制 |
+| Sample-shuffled residual | 打乱 residual 与样本对应 | 更强的冗余控制 |
 
 ### 7.5 成功标准
 
-满足任一即可支撑 RD：
+满足任一即可作为补充支持：
 
 1. High-D+High-R 中 residual-only 明显高于 shuffled residual；
 2. common+residual 明显优于 common-only；
@@ -571,8 +668,7 @@ P_c^{agr}
 |---|---|
 | Concat | 基线 |
 | UncondAlign | 无条件距离对齐 |
-| DirectAdd | 直接相加对齐摘要 |
-| Uncond InfoNCE | 普通 same-sample NCE |
+| UncondInfoNCE | 普通 pairwise same-sample NCE |
 | RA-NCE only | 只验证 reliable agreement 对齐 |
 | RD-NCE only | 只验证 residual disagreement learning |
 | CoPA-v5 full | RA-NCE + RD-NCE |
@@ -589,24 +685,29 @@ P_c^{agr}
 |---|---:|---:|---:|---:|---:|---|
 | Concat |  |  |  |  |  |  |
 | UncondAlign |  |  |  |  |  |  |
-| DirectAdd |  |  |  |  |  |  |
-| Uncond InfoNCE |  |  |  |  |  |  |
+| UncondInfoNCE |  |  |  |  |  |  |
 | CoPA-v5 |  |  |  |  |  |  |
+
+appendix：
+
+| Method | Role |
+|---|---|
+| TextInject | text-anchor DirectAdd diagnostic |
+| BalancedDirectAdd | fairer fusion-enhancement diagnostic |
 
 #### Table B：Disagreement group results
 
 | Method | Low-D Delta | Mid-D Delta | High-D Delta | High-D Error Control |
 |---|---:|---:|---:|---|
 | UncondAlign |  |  |  |  |
-| DirectAdd |  |  |  |  |
-| Uncond InfoNCE |  |  |  |  |
+| UncondInfoNCE |  |  |  |  |
 | CoPA-v5 |  |  |  |  |
 
 #### Table C：Relation-state results
 
 | Method | RA | UA | RD | ND | RD Error Control |
 |---|---:|---:|---:|---:|---|
-| Uncond InfoNCE |  |  |  |  |  |
+| UncondInfoNCE |  |  |  |  |  |
 | RA-NCE only |  |  |  |  |  |
 | RD-NCE only |  |  |  |  |  |
 | CoPA-v5 |  |  |  |  |  |
@@ -795,30 +896,35 @@ B=512\text{ or }1024
 
 ## 13. 代码实现建议
 
-### 13.1 新增文件结构
+### 13.1 当前代码组织原则
 
-建议新增：
+当前不要另起一个完全独立的 `code/copa_v5` 目录。已有实验代码位于：
 
 ```text
-code/
-  copa_v5/
-    models/
-      copa_nce_model.py
-      projection_heads.py
-      residual_heads.py
-    losses/
-      gated_infonce.py
-      residual_nce.py
-      prototype_nce.py
-    utils/
-      relation_gate.py
-      prototype_memory.py
-      subgroup_eval.py
-    scripts/
-      run_copa_v5.py
-      run_infonce_baseline.py
-      run_residual_probe.py
+code/disagreement_phenomenon/
+  src/
+  scripts/
+  backup/
 ```
+
+当前 `run_phenomenon.py` 已经承担了过多 orchestration、表格拼接和 CSV 输出。后续实现 CoPA-v5 前，建议先把它拆成：
+
+```text
+src/runners.py              # train_best_alignment / direct_add / infonce / future copa
+src/experiment_tables.py    # delta、relation-state、calibration、concat-aware 表
+src/evaluation.py           # grouped metrics、relation delta、summary row 构造
+src/relation_gate.py        # future CoPA-v5 soft gates
+src/prototype_memory.py     # future RD prototype memory
+```
+
+脚本只保留：
+
+```text
+scripts/run_phenomenon.py   # 单 seed orchestration
+scripts/run_multi_seed.py   # 多 seed 调度和汇总
+```
+
+这样既延续当前动机实验结果，又避免复制出另一套数据/训练/评估逻辑。
 
 ### 13.2 relation_gate.py
 
@@ -940,8 +1046,8 @@ code/
 
 1. Concat；
 2. UncondAlign；
-3. DirectAdd；
-4. Uncond InfoNCE；
+3. UncondInfoNCE；
+4. TextInject / BalancedDirectAdd appendix；
 5. RA-NCE only；
 6. RD-prototype-NCE only；
 7. CoPA-v5 full；
@@ -967,13 +1073,13 @@ code/
 论文实验顺序建议：
 
 1. **Motivation Analysis**  
-   证明无条件对齐、DirectAdd、普通 InfoNCE 的收益依赖 relation state。
+   证明无条件对齐、普通 pairwise InfoNCE 的收益依赖 relation state。
 
-2. **Residual Probe**  
-   证明 High-D+High-R residual 可能具有判别价值。
+2. **Residual Probe as Diagnostic**
+   检查 High-D+High-R text-anchor residual 是否具有补充判别价值。
 
 3. **Main Results**  
-   CoPA-v5 vs Concat / UncondAlign / DirectAdd / UncondInfoNCE。
+   CoPA-v5 vs Concat / UncondAlign / UncondInfoNCE。
 
 4. **Ablation Study**  
    RA-NCE、RD-NCE、label-aware gate、detach、prototype NCE。

@@ -230,6 +230,18 @@ Kernel-MMD grouping also remains available as a backup diagnostic:
 --disagreement_metric kernel_mmd --pair_mode text_anchor
 ```
 
+Prediction-class conditional batch MMD can be enabled as a distribution-level
+appendix diagnostic:
+
+```powershell
+--run_kernel_dist_diagnostic --kernel_dist_min_group_size 10
+```
+
+This diagnostic groups hidden states by reference-model predicted class and
+relation state, then computes RBF-MMD between text/audio and text/vision batch
+distributions. It does not use test labels, replace `D_sample`, or enter the
+training loss.
+
 The older specific flags `--nce_pair_mode`, `--disagreement_pair_mode`,
 `--kernel_pair_mode`, and `--align_pair_mode` are kept for compatibility, but
 they must match the unified `--pair_mode` when provided. `--direct_add_pair_mode`
@@ -251,6 +263,8 @@ high_d_reliability_delta.csv
 relation_state_metrics.csv
 relation_state_delta.csv
 relation_state_distribution_calibration.csv
+kernel_distribution_relation_metrics.csv
+kernel_distribution_relation_summary.csv
 uncond_align_relation_delta.csv
 direct_add_delta_metrics.csv
 direct_add_relation_state_delta.csv
@@ -279,6 +293,7 @@ multi_seed_delta_summary.csv
 error_control_report.csv
 relation_state_delta_summary.csv
 relation_state_distribution_calibration_summary.csv
+kernel_distribution_relation_summary.csv
 uncond_align_relation_delta_summary.csv
 direct_add_delta_summary.csv
 direct_add_relation_state_delta_summary.csv

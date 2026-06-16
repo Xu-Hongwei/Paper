@@ -382,6 +382,195 @@ def kernel_pairwise_disagreement(
     }
 
 
+def rbf_mmd_squared(
+    left: np.ndarray,
+    right: np.ndarray,
+    bandwidth: float,
+) -> float:
+    """计算两组特征的 biased RBF-MMD^2。
+
+    这里把一批特征当作经验分布，比较两个模态在该批内的分布距离。
+    若 left/right 是同一数组，biased 估计会精确为 0，便于测试边界。
+
+    Args:
+        left: 第一个模态的批特征，shape (N, D)。
+        right: 第二个模态的批特征，shape (M, D)。
+        bandwidth: RBF 核带宽，必须为正。
+
+    Returns:
+        MMD^2 标量，数值下界裁剪为 0。
+
+    Raises:
+        ValueError: 任一批为空或 bandwidth 非正时抛出。
+    """
+    if bandwidth <= 0:
+        raise ValueError("bandwidth must be positive.")
+    if left.shape[0] == 0 or right.shape[0] == 0:
+        raise ValueError("MMD batches must be non-empty.")
+    k_xx = _rbf_kernel(left, left, bandwidth).mean()
+    k_yy = _rbf_kernel(right, right, bandwidth).mean()
+    k_xy = _rbf_kernel(left, right, bandwidth).mean()
+    return max(0.0, float(k_xx + k_yy - 2.0 * k_xy))
+
+
+def _subsample_indices(
+    indices: np.ndarray,
+    *,
+    max_samples: int,
+    seed: int,
+) -> np.ndarray:
+    if max_samples <= 0 or indices.shape[0] <= max_samples:
+        return indices
+    rng = np.random.default_rng(seed)
+    return np.sort(rng.choice(indices, size=max_samples, replace=False))
+
+
+def kernel_distribution_relation_metrics(
+    pred: dict[str, np.ndarray],
+    relation_states: np.ndarray,
+    groups: np.ndarray,
+    reliability: dict[str, np.ndarray],
+    disagreement: np.ndarray,
+    *,
+    split: str,
+    num_classes: int,
+    bandwidth: float,
+    pair_mode: str,
+    min_group_size: int = 10,
+    max_group_samples: int = 1024,
+    seed: int = 0,
+) -> pd.DataFrame:
+    """按预测类条件批计算关系状态上的核分布诊断。
+
+    分组只使用 reference diagnostic model 的预测类，不使用真实标签；该表用于
+    motivation/appendix 诊断，不替代单样本 D_sample 分组。
+
+    Args:
+        pred: predict() 返回的字典，需含 y_pred 与 h_t/h_v/h_a。
+        relation_states: 每个样本的 RA/UA/RD/ND/Mid-D 状态。
+        groups: 每个样本的 Low-D/Mid-D/High-D 标签。
+        reliability: sample_reliability() 返回的可靠性字典。
+        disagreement: 每个样本的 D_sample。
+        split: 数据 split 名称。
+        num_classes: 分类类别数，用于固定 predicted_class 输出范围。
+        bandwidth: validation hidden features 上解析出的 RBF bandwidth。
+        pair_mode: text_anchor 或 full_pair，仅用于记录主分析口径。
+        min_group_size: 小于该数量的关系状态/预测类批跳过 MMD。
+        max_group_samples: 每个批最多用于 MMD 的样本数，防止核矩阵过大。
+        seed: 子采样随机种子。
+
+    Returns:
+        每行一个 split/relation_state/predicted_class 批的分布诊断表。
+    """
+    rows: list[dict[str, object]] = []
+    pred_class = np.asarray(pred["y_pred"]).reshape(-1)
+    relation_states = np.asarray(relation_states).reshape(-1)
+    groups = np.asarray(groups).reshape(-1)
+    disagreement = np.asarray(disagreement).reshape(-1)
+    for group_index, relation_state in enumerate(RELATION_STATE_GROUP_ORDER):
+        group_mask = relation_states == relation_state
+        for cls in range(num_classes):
+            indices = np.where(group_mask & (pred_class == cls))[0]
+            n = int(indices.shape[0])
+            used = _subsample_indices(
+                indices,
+                max_samples=max_group_samples,
+                seed=seed + group_index * 1009 + cls,
+            )
+            row: dict[str, object] = {
+                "split": split,
+                "group": relation_state,
+                "relation_state_desc": RELATION_STATE_DESCRIPTIONS.get(
+                    relation_state,
+                    relation_state,
+                ),
+                "predicted_class": int(cls),
+                "n": n,
+                "used_n": int(used.shape[0]) if n >= min_group_size else 0,
+                "sampled": bool(n > max_group_samples),
+                "min_group_size": int(min_group_size),
+                "max_group_samples": int(max_group_samples),
+                "bandwidth": float(bandwidth),
+                "pair_mode": pair_mode,
+                "status": "ok" if n >= min_group_size else "skipped_min_group_size",
+                "avg_D_sample": float(np.mean(disagreement[indices])) if n else np.nan,
+                "avg_R": float(np.mean(reliability["R_sample"][indices])) if n else np.nan,
+                "avg_R_text": float(np.mean(reliability["R_text"][indices])) if n else np.nan,
+                "avg_R_audio": float(np.mean(reliability["R_audio"][indices])) if n else np.nan,
+                "avg_R_vision": float(np.mean(reliability["R_vision"][indices])) if n else np.nan,
+            }
+            if n >= min_group_size:
+                mmd_ta = rbf_mmd_squared(pred["h_t"][used], pred["h_a"][used], bandwidth)
+                mmd_tv = rbf_mmd_squared(pred["h_t"][used], pred["h_v"][used], bandwidth)
+                mmd_va = rbf_mmd_squared(pred["h_v"][used], pred["h_a"][used], bandwidth)
+                row.update(
+                    {
+                        "mmd_ta": mmd_ta,
+                        "mmd_tv": mmd_tv,
+                        "mmd_va": mmd_va,
+                        "D_dist_text_anchor": float((mmd_ta + mmd_tv) / 2.0),
+                        "D_dist_full_pair": float((mmd_ta + mmd_tv + mmd_va) / 3.0),
+                    }
+                )
+            else:
+                row.update(
+                    {
+                        "mmd_ta": np.nan,
+                        "mmd_tv": np.nan,
+                        "mmd_va": np.nan,
+                        "D_dist_text_anchor": np.nan,
+                        "D_dist_full_pair": np.nan,
+                    }
+                )
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def summarize_kernel_distribution_metrics(metrics: pd.DataFrame) -> pd.DataFrame:
+    """按 split/relation_state 汇总预测类条件批 MMD 诊断。
+
+    MMD 与均值类指标用各 predicted-class 批的样本数做加权平均；跳过的批
+    不参与 MMD 加权，但其样本数仍保留在 total_n 中。
+    """
+    rows: list[dict[str, object]] = []
+    value_cols = (
+        "mmd_ta",
+        "mmd_tv",
+        "mmd_va",
+        "D_dist_text_anchor",
+        "D_dist_full_pair",
+        "avg_D_sample",
+        "avg_R",
+        "avg_R_text",
+        "avg_R_audio",
+        "avg_R_vision",
+    )
+    for (split, group), frame in metrics.groupby(["split", "group"], sort=False):
+        row: dict[str, object] = {
+            "split": split,
+            "group": group,
+            "relation_state_desc": frame["relation_state_desc"].iloc[0],
+            "total_n": int(frame["n"].sum()),
+            "valid_batch_count": int((frame["status"] == "ok").sum()),
+            "skipped_batch_count": int((frame["status"] != "ok").sum()),
+            "min_group_size": int(frame["min_group_size"].iloc[0]),
+            "max_group_samples": int(frame["max_group_samples"].iloc[0]),
+            "bandwidth": float(frame["bandwidth"].iloc[0]),
+            "pair_mode": frame["pair_mode"].iloc[0],
+        }
+        for column in value_cols:
+            values = pd.to_numeric(frame[column], errors="coerce")
+            weights = pd.to_numeric(frame["n"], errors="coerce")
+            valid = values.notna() & weights.notna() & (weights > 0)
+            row[column] = (
+                float(np.average(values[valid], weights=weights[valid]))
+                if valid.any()
+                else np.nan
+            )
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
 def sample_disagreement_from_pairwise(
     distances: dict[str, np.ndarray],
     *,

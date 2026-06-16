@@ -49,11 +49,11 @@ version5 在这个基础上做一次关键修改：
 
 ### 0.2 为什么要改成 InfoNCE
 
-当前 20-seed 实验说明：
+早期 v4 / prototype 多 seed 实验说明：
 
 1. CoPA 目前在 overall 上有小幅稳定提升；
 2. 但 relation-state 中 RD 的效果没有稳定打出来；
-3. 无条件对齐和 DirectAdd 在 High-D 上会出现稳定伤害；
+3. 无条件对齐和 DirectAdd/TextInject 类方法在 High-D 上会出现稳定伤害；
 4. 因此问题不是“要不要对齐”，而是“哪些样本适合对齐，哪些样本应该学习差异”。
 
 所以 v5 的核心设计是：
@@ -69,6 +69,31 @@ version5 在这个基础上做一次关键修改：
 \[
 \text{Uncertain / Noisy Relations} \Rightarrow \text{relation learning down-weighted}
 \]
+
+### 0.3 当前代码实现状态
+
+当前 `code/disagreement_phenomenon` 还没有实现完整 CoPA-v5 主方法。它实现的是 **CoPA-v5 motivation evidence loop**，也就是先验证：
+
+1. 普通 same-sample alignment / InfoNCE 的收益是否依赖 relation state；
+2. text-anchor residual 是否至少具有补充诊断价值；
+3. text 作为语义锚点时，是否比三模态全互相对齐更符合任务假设。
+
+当前代码主线为：
+
+```text
+three_class + text_anchor + balanced_within_d
+```
+
+其中：
+
+- `Concat` 是监督融合基线；
+- `UncondAlign` 是普通同样本距离/余弦拉近；
+- `UncondInfoNCE` 更准确地说是 **UncondPairInfoNCE**：普通 pairwise same-sample InfoNCE baseline；
+- `TextInject` 是原 text-anchor DirectAdd 的重新命名，只作为 appendix/diagnostic；
+- `BalancedDirectAdd` 是更公平的 appendix baseline，不进入主动机表；
+- residual probe 是补充诊断，不再作为 v5 主命题的唯一成功条件。
+
+因此本文档后面的 CoPA-v5 主方法仍是下一阶段设计；当前已落地代码主要服务于“为什么需要 relation-gated alignment”的动机闭环。
 
 ---
 
@@ -386,11 +411,19 @@ JSD(p_i,p_j)=\frac{1}{2}KL(p_i||m)+\frac{1}{2}KL(p_j||m)
 m=\frac{1}{2}(p_i+p_j)
 \]
 
-三模态样本级平均分歧：
+三模态 full-pair 样本级平均分歧：
 
 \[
-D_{pred}^n=rac{1}{3}\left[D_{ta}^n+D_{tv}^n+D_{av}^n\right]
+D_{pred}^n=\frac{1}{3}\left[D_{ta}^n+D_{tv}^n+D_{av}^n\right]
 \]
+
+当前 motivation 主线使用 text-anchor 版本：
+
+\[
+D_{pred}^{ta/tv,n}=\frac{1}{2}\left[D_{ta}^n+D_{tv}^n\right]
+\]
+
+原因是 text 在 MOSI/MOSEI 中通常承担主要语义锚点，audio 与 vision 未必应该被强制互相对齐。`full_pair` 可以作为 appendix，对应额外加入 \(D_{av}\) 和 A-V 对齐/InfoNCE。
 
 注意：
 
@@ -591,10 +624,23 @@ CoPA-v5 只在 reliable agreement 上把同样本模态当作正样本。
 \right)
 \]
 
-三模态总损失：
+text-anchor 主线总损失：
 
 \[
 \mathcal{L}_{agr}^{NCE}
+=
+\frac{1}{2}
+\left(
+\mathcal{L}_{ta}^{agr}
++
+\mathcal{L}_{tv}^{agr}
+\right)
+\]
+
+full-pair appendix 才使用三对：
+
+\[
+\mathcal{L}_{agr,full}^{NCE}
 =
 \frac{1}{3}
 \left(
@@ -654,6 +700,14 @@ r_{ij}^n=|z_i^{r,n}-z_j^{r,n}|
 r_{ij}^n=MLP([z_i^{r,n};z_j^{r,n};|z_i^{r,n}-z_j^{r,n}|])
 \]
 
+在 text-anchor 主线中，残差只使用：
+
+\[
+r_{ta}^n,\quad r_{tv}^n
+\]
+
+不把 \(r_{av}\) 放入主 residual objective。A-V residual 可以保留为 diagnostic/appendix 对照，避免把 audio-vision 的潜在方向冲突强行纳入主路径。
+
 ## 4.2 Residual SupCon
 
 对可靠不一致 residual 做监督式对比学习：
@@ -709,20 +763,20 @@ Prototype NCE：
 
 第一版建议优先实现 Prototype Residual NCE，因为它更稳定、实现更简单。
 
-## 4.4 三模态 residual loss
+## 4.4 text-anchor residual loss
 
 \[
 \mathcal{L}_{dis}^{NCE}
 =
-\frac{1}{3}
+\frac{1}{2}
 \left(
 \mathcal{L}_{ta}^{dis}
 +
 \mathcal{L}_{tv}^{dis}
-+
-\mathcal{L}_{av}^{dis}
 \right)
 \]
+
+full-pair appendix 可再加入 \(\mathcal{L}_{av}^{dis}\)，但不作为默认论文主线。
 
 ## 4.5 直觉
 
@@ -868,7 +922,34 @@ CoPA-v5：
 
 所以 CoPA-v5 不是无条件跨模态对齐。
 
-### 8.2 与 CS-Aligner / UniAlign
+当前代码中的 `UncondInfoNCE` 是普通 pairwise same-sample baseline：
+
+```text
+text_anchor: T-A, T-V 双向 InfoNCE
+full_pair:   T-A, T-V, A-V 双向 InfoNCE
+```
+
+它不同于 MMIM。MMIM 使用 fusion-to-modality CPC 和 BA/MI 估计，目标更接近“最大化融合表示与各模态之间的信息保持”；当前 baseline 只检验“同一样本跨模态 pair 是否应被无条件视为正样本”。
+
+### 8.2 与 MMIM / Self-MM
+
+MMIM 的训练目标可以概括为：
+
+\[
+\mathcal{L}_{task}+\alpha\mathcal{L}_{CPC}-\beta\mathcal{L}_{BA/MI}
+\]
+
+它说明“主任务 + 信息/对比辅助目标”在 MSA 中是合理范式。但 CoPA-v5 不直接复现 MMIM，因为本文关注的是 relation-state-dependent same-sample positive assumption，而不是泛化的 fusion-to-modality MI maximization。
+
+Self-MM 采用多任务结构，同时训练 fusion 与单模态预测头，并动态生成单模态监督。它支持本文使用 reference model：
+
+\[
+CE_{fusion}+\eta_{uni}\cdot mean(CE_t,CE_a,CE_v)
+\]
+
+来获得单模态预测分布和 relation diagnostics。但 CoPA-v5 不使用 Self-MM 的动态伪标签作为主方法，避免把 label generation 与 relation-gated alignment 混在一起。
+
+### 8.3 与 CS-Aligner / UniAlign
 
 CS-Aligner 和 UniAlign 主要关注：
 
@@ -884,7 +965,7 @@ CoPA-v5 关注：
 - RA 与 RD 的不同学习目标；
 - 不把所有 paired modalities 当作 positive。
 
-### 8.3 与 DecAlign
+### 8.4 与 DecAlign
 
 DecAlign 强调：
 
@@ -899,7 +980,7 @@ CoPA-v5 也有 common / residual，但核心不同：
 - DecAlign 没有显式区分 RA / RD / UA / ND；
 - CoPA-v5 不把 reliable disagreement 强行对齐，而是学习 residual contrastive structure。
 
-### 8.4 与 CaReFlow
+### 8.5 与 CaReFlow
 
 CaReFlow 将模态 gap 视为 distribution mapping 问题，用 rectified flow 做分布映射。
 
@@ -910,7 +991,7 @@ CoPA-v5 不做全局模态分布映射，而是：
 - 对 RD 做残差学习；
 - 不对所有样本做统一映射。
 
-### 8.5 与 ARL / UDML
+### 8.6 与 ARL / UDML
 
 ARL / UDML 主要解决：
 
@@ -958,9 +1039,9 @@ CoPA-v5 主要解决：
 
 通过实验说明：
 
-- 无条件对齐和 DirectAdd 在 High-D 上不稳定；
-- 普通 same-sample InfoNCE 不能稳定替代关系门控；
-- High-D+High-R residual 具有可验证的判别价值；
+- 无条件对齐和普通 pairwise same-sample InfoNCE 的收益依赖 relation state；
+- TextInject / BalancedDirectAdd 只能作为 appendix，对主动机证明有限；
+- High-D+High-R residual 作为补充诊断，用来判断是否能进一步主张 discriminative disagreement；
 - CoPA-v5 在 overall 和 relation-state subgroup 上优于 baseline。
 
 ---

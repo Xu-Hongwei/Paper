@@ -25,6 +25,7 @@ from src.disagreement import (  # noqa: E402
     assign_relation_state_groups_balanced,
     build_group_frame,
     grouped_metrics,
+    kernel_distribution_relation_metrics,
     kernel_pairwise_disagreement,
     pairwise_disagreement,
     reliability_threshold,
@@ -33,6 +34,7 @@ from src.disagreement import (  # noqa: E402
     rows_for_method,
     sample_disagreement_from_pairwise,
     sample_reliability,
+    summarize_kernel_distribution_metrics,
     validation_thresholds,
     within_group_reliability_thresholds,
     assign_groups,
@@ -131,6 +133,30 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--nce_proj_dim", type=int, default=128)
     parser.add_argument(
+        "--run_dynamic_fusion",
+        action="store_true",
+        help="Train an EMOE-style DynamicFusion baseline with sample-level modality weights.",
+    )
+    parser.add_argument(
+        "--lambda_dynamic_weight_values",
+        type=float,
+        nargs="+",
+        default=[0.01, 0.05, 0.1, 0.5],
+        help="Weight sweep for EMOE-style router supervision.",
+    )
+    parser.add_argument(
+        "--dynamic_router_temperature",
+        type=float,
+        default=0.1,
+        help="Softmax temperature for the DynamicFusion modality router.",
+    )
+    parser.add_argument(
+        "--dynamic_weight_epsilon",
+        type=float,
+        default=1e-4,
+        help="Numerical epsilon for inverse-CE dynamic weight targets.",
+    )
+    parser.add_argument(
         "--nce_pair_mode",
         choices=("text_anchor", "full_pair"),
         default=None,
@@ -170,6 +196,20 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1024,
         help="Maximum predicted-class samples used for each class-conditional MMD.",
+    )
+    parser.add_argument(
+        "--run_kernel_dist_diagnostic",
+        action="store_true",
+        help=(
+            "Write prediction-class conditional batch MMD diagnostics for relation states. "
+            "This is appendix/motivation analysis only."
+        ),
+    )
+    parser.add_argument(
+        "--kernel_dist_min_group_size",
+        type=int,
+        default=10,
+        help="Minimum predicted-class/relation-state batch size for kernel distribution MMD.",
     )
     parser.add_argument(
         "--relation_split",
@@ -342,6 +382,7 @@ def new_model(
     *,
     direct_add_alpha: float = 0.0,
     direct_add_pair_mode: str | None = None,
+    use_dynamic_fusion: bool = False,
 ) -> MultimodalClassifier:
     return MultimodalClassifier(
         text_dim=input_dims["text"],
@@ -354,6 +395,8 @@ def new_model(
         num_classes=cfg.num_classes,
         use_nce_projection=cfg.use_nce_projection,
         nce_proj_dim=cfg.nce_proj_dim,
+        use_dynamic_fusion=use_dynamic_fusion,
+        dynamic_router_temperature=cfg.dynamic_router_temperature,
     )
 
 
@@ -631,6 +674,100 @@ def train_best_direct_add(
     )
 
 
+def train_best_dynamic_fusion(
+    input_dims: dict[str, int],
+    loaders: dict[str, DataLoader],
+    cfg: ExperimentConfig,
+    device: torch.device,
+    concat_grouped: dict[str, dict[str, float]],
+    test_groups,
+) -> tuple[
+    MultimodalClassifier,
+    dict[str, float],
+    float,
+    list[dict[str, float]],
+    dict[str, dict[str, float]],
+    list[dict[str, float]],
+]:
+    best_model: MultimodalClassifier | None = None
+    best_metrics: dict[str, float] = {}
+    best_grouped: dict[str, dict[str, float]] = {}
+    best_lambda = cfg.lambda_dynamic_weight_values[0]
+    best_score = -1.0
+    sweep_rows: list[dict[str, float]] = []
+    lambda_delta_rows: list[dict[str, float]] = []
+
+    for lambda_dynamic_weight in cfg.lambda_dynamic_weight_values:
+        reset_training_rng(loaders, cfg)
+        model = new_model(input_dims, cfg, use_dynamic_fusion=True)
+        trained, metrics = train_model(
+            model,
+            loaders["train"],
+            loaders["valid"],
+            device,
+            epochs=cfg.epochs,
+            lr=cfg.lr,
+            weight_decay=cfg.weight_decay,
+            eta_unimodal=cfg.eta_unimodal,
+            lambda_dynamic_weight=lambda_dynamic_weight,
+            dynamic_weight_epsilon=cfg.dynamic_weight_epsilon,
+            patience=cfg.patience,
+            desc=f"DynamicFusion λ={lambda_dynamic_weight}",
+            show_progress=not cfg.quiet,
+        )
+        score = metrics.get("macro_f1", -1.0)
+        sweep_rows.append(
+            {
+                "lambda_dynamic_weight": lambda_dynamic_weight,
+                "dynamic_router_temperature": cfg.dynamic_router_temperature,
+                "dynamic_weight_epsilon": cfg.dynamic_weight_epsilon,
+                **metrics,
+            }
+        )
+
+        dynamic_pred = predict(trained, loaders["test"], device)
+        dynamic_grouped = grouped_metrics(
+            dynamic_pred["y_true"],
+            dynamic_pred["y_pred"],
+            test_groups,
+        )
+        for group in ("Low-D", "Mid-D", "High-D", "Overall"):
+            lambda_delta_rows.append(
+                {
+                    "lambda_dynamic_weight": lambda_dynamic_weight,
+                    "group": group,
+                    "n": dynamic_grouped[group]["n"],
+                    "concat_acc": concat_grouped[group]["acc"],
+                    "dynamic_fusion_acc": dynamic_grouped[group]["acc"],
+                    "delta_acc": dynamic_grouped[group]["acc"] - concat_grouped[group]["acc"],
+                    "concat_macro_f1": concat_grouped[group]["macro_f1"],
+                    "dynamic_fusion_macro_f1": dynamic_grouped[group]["macro_f1"],
+                    "delta_macro_f1": dynamic_grouped[group]["macro_f1"]
+                    - concat_grouped[group]["macro_f1"],
+                    "valid_macro_f1": metrics.get("macro_f1"),
+                    "valid_acc": metrics.get("acc"),
+                    "dynamic_router_temperature": cfg.dynamic_router_temperature,
+                }
+            )
+        if score > best_score:
+            best_score = score
+            best_model = trained
+            best_metrics = metrics
+            best_grouped = dynamic_grouped
+            best_lambda = lambda_dynamic_weight
+
+    if best_model is None:
+        raise RuntimeError("DynamicFusion sweep did not train any model.")
+    return (
+        best_model,
+        best_metrics,
+        best_lambda,
+        sweep_rows,
+        best_grouped,
+        lambda_delta_rows,
+    )
+
+
 def train_best_infonce(
     input_dims: dict[str, int],
     loaders: dict[str, DataLoader],
@@ -848,6 +985,39 @@ def relation_state_calibration_frame(
     return pd.DataFrame(rows)
 
 
+def dynamic_weight_relation_frame(
+    pred: dict[str, np.ndarray],
+    relation_states: np.ndarray,
+) -> pd.DataFrame:
+    if not {"w_text", "w_vision", "w_audio"}.issubset(pred):
+        raise ValueError("DynamicFusion prediction is missing modality weights.")
+    weights = np.stack([pred["w_text"], pred["w_vision"], pred["w_audio"]], axis=1)
+    entropy = -np.sum(np.clip(weights, 1e-8, 1.0) * np.log(np.clip(weights, 1e-8, 1.0)), axis=1)
+    rows: list[dict[str, object]] = []
+    for group in RELATION_STATE_GROUP_ORDER:
+        mask = relation_states == group
+        n = int(mask.sum())
+        group_weights = weights[mask]
+        dominant = group_weights.argmax(axis=1) if n else np.array([], dtype=int)
+        rows.append(
+            {
+                "group": group,
+                "n": n,
+                "avg_w_text": float(np.mean(group_weights[:, 0])) if n else float("nan"),
+                "avg_w_vision": float(np.mean(group_weights[:, 1])) if n else float("nan"),
+                "avg_w_audio": float(np.mean(group_weights[:, 2])) if n else float("nan"),
+                "avg_weight_entropy": float(np.mean(entropy[mask])) if n else float("nan"),
+                "text_dominant_rate": float((dominant == 0).mean()) if n else float("nan"),
+                "vision_dominant_rate": float((dominant == 1).mean()) if n else float("nan"),
+                "audio_dominant_rate": float((dominant == 2).mean()) if n else float("nan"),
+                "avg_weight_gap": float(np.mean(group_weights.max(axis=1) - group_weights.min(axis=1)))
+                if n
+                else float("nan"),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def direct_add_method_name(direct_add_pair_mode: str) -> str:
     if direct_add_pair_mode == "text_anchor":
         return "TextInject"
@@ -881,12 +1051,18 @@ def main() -> int:
         nce_pair_mode=args.nce_pair_mode,
         use_nce_projection=args.use_nce_projection,
         nce_proj_dim=args.nce_proj_dim,
+        run_dynamic_fusion=args.run_dynamic_fusion,
+        lambda_dynamic_weight_values=args.lambda_dynamic_weight_values,
+        dynamic_router_temperature=args.dynamic_router_temperature,
+        dynamic_weight_epsilon=args.dynamic_weight_epsilon,
         disagreement_metric=args.disagreement_metric,
         disagreement_pair_mode=args.disagreement_pair_mode,
         kernel_bandwidth=args.kernel_bandwidth,
         kernel_pair_mode=args.kernel_pair_mode,
         kernel_class_weight=args.kernel_class_weight,
         kernel_max_class_samples=args.kernel_max_class_samples,
+        run_kernel_dist_diagnostic=args.run_kernel_dist_diagnostic,
+        kernel_dist_min_group_size=args.kernel_dist_min_group_size,
         relation_split=args.relation_split,
         residual_modes=args.residual_modes,
         tau_agreement=args.tau_agreement,
@@ -954,6 +1130,8 @@ def main() -> int:
             "kernel_pair_mode": cfg.kernel_pair_mode,
             "kernel_class_weight": cfg.kernel_class_weight,
             "kernel_max_class_samples": cfg.kernel_max_class_samples,
+            "run_kernel_dist_diagnostic": cfg.run_kernel_dist_diagnostic,
+            "kernel_dist_min_group_size": cfg.kernel_dist_min_group_size,
             "relation_split": cfg.relation_split,
             "residual_modes": cfg.residual_modes,
             "tau_agreement": cfg.tau_agreement,
@@ -975,6 +1153,19 @@ def main() -> int:
             valid_diag["h_a"],
             cfg.kernel_bandwidth,
             seed=cfg.seed,
+        )
+    kernel_dist_bandwidth: float | None = None
+    if cfg.run_kernel_dist_diagnostic:
+        kernel_dist_bandwidth = float(
+            resolved_kernel_bandwidth
+            if cfg.disagreement_metric == "kernel_mmd"
+            else resolve_kernel_bandwidth(
+                valid_diag["h_t"],
+                valid_diag["h_v"],
+                valid_diag["h_a"],
+                cfg.kernel_bandwidth,
+                seed=cfg.seed,
+            )
         )
     train_d, train_distances = sample_disagreement_for_run(
         train_diag,
@@ -1025,6 +1216,18 @@ def main() -> int:
         test_reliability["R_sample"],
         relation_split=cfg.relation_split,
     )
+    if cfg.relation_split == "global_r":
+        valid_relation_states = assign_relation_state_groups(
+            valid_groups,
+            valid_reliability["R_sample"],
+            relation_thresholds["global"],
+        )
+    else:
+        valid_relation_states = assign_relation_state_groups_balanced(
+            valid_groups,
+            valid_reliability["R_sample"],
+            relation_thresholds,
+        )
     q_r = relation_thresholds["global"]
     test_relations = {
         **test_distances,
@@ -1077,6 +1280,67 @@ def main() -> int:
         index=False,
         encoding="utf-8-sig",
     )
+
+    kernel_distribution_metrics_df = pd.DataFrame()
+    kernel_distribution_summary_df = pd.DataFrame()
+    if cfg.run_kernel_dist_diagnostic:
+        frames = []
+        for split_name, pred, states, groups, reliability, disagreement in (
+            (
+                "train",
+                train_diag,
+                train_relation_states,
+                train_groups,
+                train_reliability,
+                train_d,
+            ),
+            (
+                "valid",
+                valid_diag,
+                valid_relation_states,
+                valid_groups,
+                valid_reliability,
+                valid_d,
+            ),
+            (
+                "test",
+                test_diag,
+                test_relation_states,
+                test_groups,
+                test_reliability,
+                test_d,
+            ),
+        ):
+            frames.append(
+                kernel_distribution_relation_metrics(
+                    pred,
+                    states,
+                    groups,
+                    reliability,
+                    disagreement,
+                    split=split_name,
+                    num_classes=cfg.num_classes,
+                    bandwidth=float(kernel_dist_bandwidth),
+                    pair_mode=cfg.pair_mode,
+                    min_group_size=cfg.kernel_dist_min_group_size,
+                    max_group_samples=cfg.kernel_max_class_samples,
+                    seed=cfg.seed,
+                )
+            )
+        kernel_distribution_metrics_df = pd.concat(frames, ignore_index=True)
+        kernel_distribution_summary_df = summarize_kernel_distribution_metrics(
+            kernel_distribution_metrics_df
+        )
+        kernel_distribution_metrics_df.to_csv(
+            run_dir / "kernel_distribution_relation_metrics.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        kernel_distribution_summary_df.to_csv(
+            run_dir / "kernel_distribution_relation_summary.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
 
     residual_probe_df = residual_probe_frame(
         train_diag,
@@ -1255,6 +1519,83 @@ def main() -> int:
         encoding="utf-8-sig",
     )
 
+    dynamic_fusion_model = None
+    dynamic_fusion_valid = None
+    best_lambda_dynamic_weight = None
+    dynamic_fusion_grouped = None
+    dynamic_fusion_relation_grouped = None
+    dynamic_fusion_delta_df = pd.DataFrame()
+    dynamic_fusion_relation_delta_df = pd.DataFrame()
+    dynamic_fusion_weight_relation_df = pd.DataFrame()
+    if cfg.run_dynamic_fusion:
+        (
+            dynamic_fusion_model,
+            dynamic_fusion_valid,
+            best_lambda_dynamic_weight,
+            dynamic_fusion_sweep_rows,
+            dynamic_fusion_grouped,
+            dynamic_fusion_lambda_delta_rows,
+        ) = train_best_dynamic_fusion(
+            input_dims,
+            loaders,
+            cfg,
+            device,
+            concat_grouped,
+            test_groups,
+        )
+        dynamic_fusion_pred = predict(dynamic_fusion_model, loaders["test"], device)
+        dynamic_fusion_relation_grouped = grouped_metrics(
+            dynamic_fusion_pred["y_true"],
+            dynamic_fusion_pred["y_pred"],
+            test_relation_states,
+            group_order=RELATION_STATE_GROUP_ORDER,
+            include_overall=False,
+        )
+        dynamic_fusion_weight_relation_df = dynamic_weight_relation_frame(
+            dynamic_fusion_pred,
+            test_relation_states,
+        )
+        dynamic_fusion_weight_relation_df["lambda_dynamic_weight"] = (
+            best_lambda_dynamic_weight
+        )
+        dynamic_fusion_weight_relation_df["dynamic_router_temperature"] = (
+            cfg.dynamic_router_temperature
+        )
+        dynamic_fusion_weight_relation_df.to_csv(
+            run_dir / "dynamic_fusion_weight_relation_summary.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        pd.DataFrame(dynamic_fusion_sweep_rows).to_csv(
+            run_dir / "dynamic_fusion_lambda_sweep_valid.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        pd.DataFrame(dynamic_fusion_lambda_delta_rows).to_csv(
+            run_dir / "dynamic_fusion_lambda_test_delta_metrics.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        dynamic_fusion_delta_rows = []
+        for group in ("Low-D", "Mid-D", "High-D", "Overall"):
+            dynamic_fusion_delta_rows.append(
+                {
+                    "group": group,
+                    "delta_acc": dynamic_fusion_grouped[group]["acc"]
+                    - concat_grouped[group]["acc"],
+                    "delta_macro_f1": dynamic_fusion_grouped[group]["macro_f1"]
+                    - concat_grouped[group]["macro_f1"],
+                    "lambda_dynamic_weight": best_lambda_dynamic_weight,
+                    "dynamic_router_temperature": cfg.dynamic_router_temperature,
+                }
+            )
+        dynamic_fusion_delta_df = pd.DataFrame(dynamic_fusion_delta_rows)
+        dynamic_fusion_delta_df.to_csv(
+            run_dir / "dynamic_fusion_delta_metrics.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+
     infonce_model = None
     infonce_valid = None
     best_lambda_nce = None
@@ -1388,6 +1729,17 @@ def main() -> int:
         row["direct_add_alpha"] = best_balanced_direct_add_alpha
         row["direct_add_pair_mode"] = "balanced"
     relation_state_rows.extend(balanced_direct_add_relation_rows)
+    if cfg.run_dynamic_fusion and dynamic_fusion_relation_grouped is not None:
+        dynamic_fusion_relation_rows = rows_for_method(
+            "DynamicFusion",
+            dynamic_fusion_relation_grouped,
+            group_order=RELATION_STATE_GROUP_ORDER,
+            include_overall=False,
+        )
+        for row in dynamic_fusion_relation_rows:
+            row["lambda_dynamic_weight"] = best_lambda_dynamic_weight
+            row["dynamic_router_temperature"] = cfg.dynamic_router_temperature
+        relation_state_rows.extend(dynamic_fusion_relation_rows)
     if cfg.run_infonce and infonce_relation_grouped is not None:
         infonce_relation_rows = rows_for_method(
             "UncondInfoNCE",
@@ -1475,6 +1827,28 @@ def main() -> int:
         index=False,
         encoding="utf-8-sig",
     )
+    if cfg.run_dynamic_fusion and dynamic_fusion_relation_grouped is not None:
+        dynamic_fusion_relation_state_delta_rows = []
+        for group in RELATION_STATE_GROUP_ORDER:
+            dynamic_fusion_relation_state_delta_rows.append(
+                {
+                    "group": group,
+                    "delta_acc": dynamic_fusion_relation_grouped[group]["acc"]
+                    - concat_relation_grouped[group]["acc"],
+                    "delta_macro_f1": dynamic_fusion_relation_grouped[group]["macro_f1"]
+                    - concat_relation_grouped[group]["macro_f1"],
+                    "lambda_dynamic_weight": best_lambda_dynamic_weight,
+                    "dynamic_router_temperature": cfg.dynamic_router_temperature,
+                }
+            )
+        dynamic_fusion_relation_delta_df = pd.DataFrame(
+            dynamic_fusion_relation_state_delta_rows
+        )
+        dynamic_fusion_relation_delta_df.to_csv(
+            run_dir / "dynamic_fusion_relation_state_delta.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
     if cfg.run_infonce and infonce_relation_grouped is not None:
         infonce_relation_state_delta_rows = []
         for group in RELATION_STATE_GROUP_ORDER:
@@ -1518,6 +1892,11 @@ def main() -> int:
                 "balanced_direct_add_macro_f1": balanced_direct_add_relation_grouped[
                     group
                 ]["macro_f1"],
+                "dynamic_fusion_macro_f1": (
+                    dynamic_fusion_relation_grouped[group]["macro_f1"]
+                    if dynamic_fusion_relation_grouped is not None
+                    else float("nan")
+                ),
                 "infonce_macro_f1": (
                     infonce_relation_grouped[group]["macro_f1"]
                     if infonce_relation_grouped is not None
@@ -1568,6 +1947,10 @@ def main() -> int:
                 "direct_add_alpha": best_direct_add_alpha,
                 "direct_add_pair_mode": cfg.direct_add_pair_mode,
                 "balanced_direct_add_alpha": best_balanced_direct_add_alpha,
+                "lambda_dynamic_weight": best_lambda_dynamic_weight,
+                "dynamic_router_temperature": cfg.dynamic_router_temperature
+                if cfg.run_dynamic_fusion
+                else "",
                 "lambda_nce": best_lambda_nce,
                 "nce_pair_mode": cfg.nce_pair_mode if cfg.run_infonce else "",
                 "use_nce_projection": cfg.use_nce_projection if cfg.run_infonce else "",
@@ -1600,6 +1983,12 @@ def main() -> int:
         row["direct_add_alpha"] = best_balanced_direct_add_alpha
         row["direct_add_pair_mode"] = "balanced"
     rows.extend(balanced_direct_add_rows)
+    if cfg.run_dynamic_fusion and dynamic_fusion_grouped is not None:
+        dynamic_fusion_rows = rows_for_method("DynamicFusion", dynamic_fusion_grouped)
+        for row in dynamic_fusion_rows:
+            row["lambda_dynamic_weight"] = best_lambda_dynamic_weight
+            row["dynamic_router_temperature"] = cfg.dynamic_router_temperature
+        rows.extend(dynamic_fusion_rows)
     if cfg.run_infonce and infonce_grouped is not None:
         infonce_rows = rows_for_method("UncondInfoNCE", infonce_grouped)
         for row in infonce_rows:
@@ -1719,6 +2108,8 @@ def main() -> int:
         balanced_direct_add_model.state_dict(),
         run_dir / "balanced_direct_add_model.pt",
     )
+    if cfg.run_dynamic_fusion and dynamic_fusion_model is not None:
+        torch.save(dynamic_fusion_model.state_dict(), run_dir / "dynamic_fusion_model.pt")
     if cfg.run_infonce and infonce_model is not None:
         torch.save(infonce_model.state_dict(), run_dir / "infonce_model.pt")
     save_json(
@@ -1737,6 +2128,12 @@ def main() -> int:
             "direct_add_pair_mode": cfg.direct_add_pair_mode,
             "balanced_direct_add_valid": balanced_direct_add_valid,
             "best_balanced_direct_add_alpha": best_balanced_direct_add_alpha,
+            "run_dynamic_fusion": cfg.run_dynamic_fusion,
+            "dynamic_fusion_valid": dynamic_fusion_valid,
+            "best_lambda_dynamic_weight": best_lambda_dynamic_weight,
+            "lambda_dynamic_weight_values": cfg.lambda_dynamic_weight_values,
+            "dynamic_router_temperature": cfg.dynamic_router_temperature,
+            "dynamic_weight_epsilon": cfg.dynamic_weight_epsilon,
             "infonce_valid": infonce_valid,
             "best_lambda_nce": best_lambda_nce,
             "nce_temperature": cfg.nce_temperature,
@@ -1749,6 +2146,9 @@ def main() -> int:
             "kernel_pair_mode": cfg.kernel_pair_mode,
             "kernel_class_weight": cfg.kernel_class_weight,
             "kernel_max_class_samples": cfg.kernel_max_class_samples,
+            "run_kernel_dist_diagnostic": cfg.run_kernel_dist_diagnostic,
+            "kernel_dist_min_group_size": cfg.kernel_dist_min_group_size,
+            "kernel_dist_bandwidth": kernel_dist_bandwidth,
             "relation_split": cfg.relation_split,
             "residual_modes": cfg.residual_modes,
             "resolved_kernel_bandwidth": resolved_kernel_bandwidth
@@ -1779,6 +2179,9 @@ def main() -> int:
     print(direct_add_delta_df.to_string(index=False))
     print("\nBalancedDirectAdd delta metrics:")
     print(balanced_direct_add_delta_df.to_string(index=False))
+    if cfg.run_dynamic_fusion:
+        print("\nDynamicFusion delta metrics:")
+        print(dynamic_fusion_delta_df.to_string(index=False))
     if cfg.run_infonce:
         print("\nInfoNCE delta metrics:")
         print(infonce_delta_df.to_string(index=False))
@@ -1790,10 +2193,18 @@ def main() -> int:
     print(relation_state_delta_df.to_string(index=False))
     print("\nRelation-state distribution/calibration:")
     print(calibration_df.to_string(index=False))
+    if cfg.run_kernel_dist_diagnostic:
+        print("\nKernel distribution relation summary:")
+        print(kernel_distribution_summary_df.to_string(index=False))
     print("\nDirectAdd relation-state delta metrics:")
     print(direct_add_relation_state_delta_df.to_string(index=False))
     print("\nBalancedDirectAdd relation-state delta metrics:")
     print(balanced_direct_add_relation_state_delta_df.to_string(index=False))
+    if cfg.run_dynamic_fusion:
+        print("\nDynamicFusion relation-state delta metrics:")
+        print(dynamic_fusion_relation_delta_df.to_string(index=False))
+        print("\nDynamicFusion weight relation summary:")
+        print(dynamic_fusion_weight_relation_df.to_string(index=False))
     print("\nConcat-aware motivation table:")
     print(concat_aware_df.to_string(index=False))
     print(f"\nSaved outputs to: {run_dir}")

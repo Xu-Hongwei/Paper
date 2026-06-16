@@ -15,6 +15,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 RUNNER = ROOT / "scripts" / "run_phenomenon.py"
 
+from src.disagreement import (  # noqa: E402
+    kernel_distribution_relation_metrics,
+    rbf_mmd_squared,
+)
 from src.model import unconditional_alignment_loss, unconditional_infonce_loss  # noqa: E402
 
 
@@ -82,8 +86,53 @@ def check_projection_loss_boundary() -> None:
         raise AssertionError("UncondInfoNCE must use z_* projections when they are present.")
 
 
+def check_kernel_distribution_diagnostic_boundary() -> None:
+    rng = np.random.default_rng(19)
+    base = rng.normal(size=(24, 6)).astype("float32")
+    same = rbf_mmd_squared(base, base, bandwidth=1.0)
+    shifted = rbf_mmd_squared(base, base + 0.75, bandwidth=1.0)
+    if same > 1e-8:
+        raise AssertionError("MMD of identical batches should be near zero.")
+    if shifted <= same:
+        raise AssertionError("MMD should increase when one batch is shifted.")
+
+    pred = {
+        "y_true": np.ones(8, dtype=np.int64),
+        "y_pred": np.zeros(8, dtype=np.int64),
+        "h_t": rng.normal(size=(8, 5)).astype("float32"),
+        "h_v": rng.normal(size=(8, 5)).astype("float32"),
+        "h_a": rng.normal(size=(8, 5)).astype("float32"),
+    }
+    reliability = {
+        "R_sample": np.ones(8),
+        "R_text": np.ones(8),
+        "R_vision": np.ones(8),
+        "R_audio": np.ones(8),
+    }
+    frame = kernel_distribution_relation_metrics(
+        pred,
+        np.array(["RA"] * 8, dtype=object),
+        np.array(["Low-D"] * 8, dtype=object),
+        reliability,
+        np.zeros(8),
+        split="test",
+        num_classes=2,
+        bandwidth=1.0,
+        pair_mode="text_anchor",
+        min_group_size=10,
+        seed=3,
+    )
+    ra_zero = frame[(frame["group"] == "RA") & (frame["predicted_class"] == 0)].iloc[0]
+    ra_one = frame[(frame["group"] == "RA") & (frame["predicted_class"] == 1)].iloc[0]
+    if int(ra_zero["n"]) != 8 or int(ra_one["n"]) != 0:
+        raise AssertionError("Kernel distribution grouping must use y_pred, not y_true.")
+    if ra_zero["status"] != "skipped_min_group_size" or not pd.isna(ra_zero["mmd_ta"]):
+        raise AssertionError("Small kernel distribution batches should be skipped with NaN MMD.")
+
+
 def main() -> int:
     check_projection_loss_boundary()
+    check_kernel_distribution_diagnostic_boundary()
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         data_dir = root / "mosi"
@@ -123,6 +172,9 @@ def main() -> int:
             "kernel_mmd",
             "--kernel_max_class_samples",
             "32",
+            "--run_kernel_dist_diagnostic",
+            "--kernel_dist_min_group_size",
+            "4",
             "--patience",
             "2",
         ]
@@ -146,6 +198,8 @@ def main() -> int:
             "relation_state_metrics.csv",
             "relation_state_delta.csv",
             "relation_state_distribution_calibration.csv",
+            "kernel_distribution_relation_metrics.csv",
+            "kernel_distribution_relation_summary.csv",
             "uncond_align_relation_delta.csv",
             "direct_add_alpha_sweep_valid.csv",
             "direct_add_alpha_test_delta_metrics.csv",
@@ -305,6 +359,37 @@ def main() -> int:
                 f"Smoke test failed: missing calibration columns {missing_calibration}",
                 file=sys.stderr,
             )
+            return 1
+        kernel_dist = pd.read_csv(latest / "kernel_distribution_relation_metrics.csv")
+        kernel_columns = {
+            "split",
+            "group",
+            "predicted_class",
+            "n",
+            "used_n",
+            "status",
+            "mmd_ta",
+            "mmd_tv",
+            "mmd_va",
+            "D_dist_text_anchor",
+            "D_dist_full_pair",
+            "avg_R",
+            "avg_D_sample",
+            "pair_mode",
+        }
+        missing_kernel = sorted(kernel_columns - set(kernel_dist.columns))
+        if missing_kernel:
+            print(
+                f"Smoke test failed: missing kernel distribution columns {missing_kernel}",
+                file=sys.stderr,
+            )
+            return 1
+        if "test" not in set(kernel_dist["split"]) or set(kernel_dist["pair_mode"]) != {"text_anchor"}:
+            print("Smoke test failed: kernel distribution split or pair mode is wrong.", file=sys.stderr)
+            return 1
+        kernel_summary = pd.read_csv(latest / "kernel_distribution_relation_summary.csv")
+        if kernel_summary.empty or "D_dist_text_anchor" not in kernel_summary.columns:
+            print("Smoke test failed: kernel distribution summary is incomplete.", file=sys.stderr)
             return 1
         residual_by_mode = pd.read_csv(latest / "residual_probe_by_mode.csv")
         if residual_by_mode.empty or not {"abs", "signed", "prod", "all"}.issubset(

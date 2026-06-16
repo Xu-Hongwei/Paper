@@ -39,6 +39,8 @@ def compute_loss(
     lambda_nce: float = 0.0,
     nce_temperature: float = 0.1,
     nce_pair_mode: str = "text_anchor",
+    lambda_dynamic_weight: float = 0.0,
+    dynamic_weight_epsilon: float = 1e-4,
 ) -> torch.Tensor:
     """计算多任务训练损失。
 
@@ -53,6 +55,8 @@ def compute_loss(
         lambda_nce: InfoNCE 对比损失权重（0 表示不使用）。
         nce_temperature: InfoNCE 温度。
         nce_pair_mode: InfoNCE 的模态对模式。
+        lambda_dynamic_weight: EMOE-style 动态权重监督损失权重。
+        dynamic_weight_epsilon: 误差反比权重的数值稳定项。
 
     Returns:
         标量损失值。
@@ -75,6 +79,27 @@ def compute_loss(
             outputs,
             temperature=nce_temperature,
             pair_mode=nce_pair_mode,
+        )
+    if lambda_dynamic_weight > 0:
+        if "channel_weight" not in outputs:
+            raise ValueError("lambda_dynamic_weight requires outputs['channel_weight'].")
+        ce_t = F.cross_entropy(outputs["logits_t"], labels, reduction="none")
+        ce_v = F.cross_entropy(outputs["logits_v"], labels, reduction="none")
+        ce_a = F.cross_entropy(outputs["logits_a"], labels, reduction="none")
+        inv_error = torch.stack(
+            [
+                1.0 / (ce_t + dynamic_weight_epsilon),
+                1.0 / (ce_v + dynamic_weight_epsilon),
+                1.0 / (ce_a + dynamic_weight_epsilon),
+            ],
+            dim=-1,
+        )
+        target_weight = inv_error / inv_error.sum(dim=-1, keepdim=True).clamp_min(
+            dynamic_weight_epsilon
+        )
+        loss = loss + lambda_dynamic_weight * F.mse_loss(
+            outputs["channel_weight"],
+            target_weight.detach(),
         )
     return loss
 
@@ -113,6 +138,7 @@ def predict(
     feats_t: list[np.ndarray] = []
     feats_v: list[np.ndarray] = []
     feats_a: list[np.ndarray] = []
+    weights: list[np.ndarray] = []
 
     for batch in loader:
         batch = move_batch(batch, device)
@@ -129,8 +155,10 @@ def predict(
         feats_t.append(outputs["h_t"].detach().cpu().numpy())
         feats_v.append(outputs["h_v"].detach().cpu().numpy())
         feats_a.append(outputs["h_a"].detach().cpu().numpy())
+        if "channel_weight" in outputs:
+            weights.append(outputs["channel_weight"].detach().cpu().numpy())
 
-    return {
+    result = {
         "y_true": np.concatenate(y_true),
         "y_reg": np.concatenate(y_reg),
         "y_pred": np.concatenate(y_pred),
@@ -143,6 +171,12 @@ def predict(
         "h_v": np.concatenate(feats_v),
         "h_a": np.concatenate(feats_a),
     }
+    if weights:
+        weight_array = np.concatenate(weights)
+        result["w_text"] = weight_array[:, 0]
+        result["w_vision"] = weight_array[:, 1]
+        result["w_audio"] = weight_array[:, 2]
+    return result
 
 
 def evaluate(
@@ -179,6 +213,8 @@ def train_model(
     lambda_nce: float = 0.0,
     nce_temperature: float = 0.1,
     nce_pair_mode: str = "text_anchor",
+    lambda_dynamic_weight: float = 0.0,
+    dynamic_weight_epsilon: float = 1e-4,
     patience: int = 8,
     desc: str = "train",
     show_progress: bool = True,
@@ -202,6 +238,8 @@ def train_model(
         lambda_nce: InfoNCE 损失权重。
         nce_temperature: InfoNCE 温度。
         nce_pair_mode: InfoNCE 模态对模式。
+        lambda_dynamic_weight: EMOE-style 动态权重监督损失权重。
+        dynamic_weight_epsilon: 动态权重监督中的误差反比稳定项。
         patience: 早停耐心值。
         desc: tqdm 进度条描述。
         show_progress: 是否显示进度条。
@@ -236,6 +274,8 @@ def train_model(
                 lambda_nce=lambda_nce,
                 nce_temperature=nce_temperature,
                 nce_pair_mode=nce_pair_mode,
+                lambda_dynamic_weight=lambda_dynamic_weight,
+                dynamic_weight_epsilon=dynamic_weight_epsilon,
             )
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)

@@ -533,6 +533,51 @@ confidence-based reliability
 
 也就是“基于预测置信度的可靠性诊断”。
 
+### 9.1 Kernel distribution diagnostic 怎么看
+
+可选开启：
+
+```powershell
+--run_kernel_dist_diagnostic --kernel_dist_min_group_size 10
+```
+
+输出：
+
+```text
+kernel_distribution_relation_metrics.csv
+kernel_distribution_relation_summary.csv
+```
+
+它不是重新分组，也不替代 `D_sample`。它把 reference diagnostic model 的
+hidden states 按：
+
+```text
+split + relation_state + predicted_class
+```
+
+聚成预测类条件批，然后用 validation hidden features 解析出的高斯核带宽计算：
+
+```text
+MMD(text, audio)
+MMD(text, vision)
+D_dist_text_anchor = mean(MMD_ta, MMD_tv)
+```
+
+这个表回答的是：
+
+```text
+RA/RD 等关系状态在分布级跨模态差异上是否也有趋势？
+单样本 JSD 分组是否可能受到单样本预测抖动影响？
+```
+
+注意：
+
+```text
+predicted_class 来自 reference model 预测，不使用 test label。
+MMD 只解释分布差异，不解释预测是否真实可靠。
+t-SNE 只能做可视化，不能作为分组或 D 的计算依据。
+```
+
 ## 10. 主线 baseline
 
 ### 10.1 Concat
@@ -925,6 +970,8 @@ delta_metrics.csv
 lambda_sweep_valid.csv
 lambda_test_delta_metrics.csv
 relation_state_distribution_calibration.csv
+kernel_distribution_relation_metrics.csv
+kernel_distribution_relation_summary.csv
 relation_state_metrics.csv
 relation_state_delta.csv
 uncond_align_relation_delta.csv
@@ -956,6 +1003,7 @@ multi_seed_group_metrics_summary.csv
 multi_seed_delta_summary.csv
 relation_state_delta_summary.csv
 relation_state_distribution_calibration_summary.csv
+kernel_distribution_relation_summary.csv
 uncond_align_relation_delta_summary.csv
 infonce_delta_summary.csv
 infonce_relation_state_delta_summary.csv
@@ -990,6 +1038,15 @@ avg_R 是否符合 High-R/Low-R 的直觉
 High-R accuracy 是否真的更高
 class ratio 是否严重偏斜
 ```
+
+如果开启了 distribution-level kernel diagnostic，再补看：
+
+```text
+kernel_distribution_relation_summary.csv
+```
+
+它只用于检查 RA/RD 等关系状态是否也呈现批级跨模态分布差异，不替代主线
+`D_sample` 分组。
 
 ### 第二步：看主线 baseline
 

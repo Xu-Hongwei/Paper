@@ -77,6 +77,8 @@ class ExperimentConfig:
         kernel_pair_mode: 核分歧的模态对模式。
         kernel_class_weight: 核分歧中类别 MMD 的权重。
         kernel_max_class_samples: 类别 MMD 中每类最大采样数。
+        run_kernel_dist_diagnostic: 是否运行预测类条件批的核分布诊断。
+        kernel_dist_min_group_size: 核分布诊断中每个关系状态/预测类批的最小样本数。
         relation_split: 关系状态划分方式（"balanced_within_d" 等）。
         residual_modes: 残差探针模式列表。
         tau_agreement: 一致性转换的温度参数。
@@ -113,12 +115,20 @@ class ExperimentConfig:
     nce_pair_mode: str = "text_anchor"
     use_nce_projection: bool = True
     nce_proj_dim: int = 128
+    run_dynamic_fusion: bool = False
+    lambda_dynamic_weight_values: list[float] = field(
+        default_factory=lambda: [0.01, 0.05, 0.1, 0.5]
+    )
+    dynamic_router_temperature: float = 0.1
+    dynamic_weight_epsilon: float = 1e-4
     disagreement_metric: str = "prob_jsd"
     disagreement_pair_mode: str = "text_anchor"
     kernel_bandwidth: str = "median"
     kernel_pair_mode: str = "text_anchor"
     kernel_class_weight: float = 0.5
     kernel_max_class_samples: int = 1024
+    run_kernel_dist_diagnostic: bool = False
+    kernel_dist_min_group_size: int = 10
     relation_split: str = "balanced_within_d"
     residual_modes: list[str] = field(default_factory=lambda: ["abs", "signed", "prod", "all"])
     tau_agreement: float = 0.1
