@@ -11,6 +11,7 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "scripts" / "run_multi_seed.py"
+ANALYZER = ROOT / "scripts" / "analyze_v6_cause.py"
 
 
 def make_fixture(path: Path) -> None:
@@ -80,6 +81,10 @@ def main() -> int:
             "0.01",
             "--direct_add_alpha_values",
             "0.1",
+            "--run_rc_balanced_add",
+            "--rc_balanced_modes",
+            "rd_only",
+            "hard",
             "--run_infonce",
             "--lambda_nce_values",
             "0.01",
@@ -94,6 +99,7 @@ def main() -> int:
             "--run_kernel_dist_diagnostic",
             "--kernel_dist_min_group_size",
             "4",
+            "--run_residual_probe",
             "--patience",
             "1",
         ]
@@ -136,6 +142,10 @@ def main() -> int:
             "direct_add_relation_state_delta_summary.csv",
             "balanced_direct_add_relation_state_delta_all.csv",
             "balanced_direct_add_relation_state_delta_summary.csv",
+            "rc_balanced_add_delta_all.csv",
+            "rc_balanced_add_delta_summary.csv",
+            "rc_balanced_add_relation_state_delta_all.csv",
+            "rc_balanced_add_relation_state_delta_summary.csv",
             "concat_aware_motivation_all.csv",
             "concat_aware_motivation_summary.csv",
             "residual_discriminative_probe_all.csv",
@@ -165,13 +175,18 @@ def main() -> int:
             "relation_state_delta_detailed.png",
             "direct_add_relation_state_delta_detailed.png",
             "balanced_direct_add_relation_state_delta_detailed.png",
+            "rc_balanced_add_rd_only_delta_detailed.png",
+            "rc_balanced_add_rd_only_relation_state_delta_detailed.png",
+            "rc_balanced_add_hard_delta_detailed.png",
+            "rc_balanced_add_hard_relation_state_delta_detailed.png",
             "lambda_delta_macro_f1_curve.png",
             "infonce_lambda_delta_macro_f1_curve.png",
             "infonce_delta_macro_f1_detailed.png",
             "infonce_high_d_reliability_delta_detailed.png",
             "infonce_relation_state_delta_detailed.png",
             "relation_state_method_comparison_heatmap.png",
-            "experiment_one_conclusion.json",
+            "experiment_one_disagreement_difficulty.json",
+            "uncond_align_delta_conclusion.json",
             "error_control_report.csv",
         ]
         missing = [name for name in required if not (summary / name).exists()]
@@ -235,6 +250,7 @@ def main() -> int:
         )
         calibration_columns = {
             "avg_R_mean",
+            "avg_D_sample_mean",
             "text_acc_mean",
             "audio_acc_mean",
             "vision_acc_mean",
@@ -304,6 +320,99 @@ def main() -> int:
                 "Multi-seed smoke test failed: BalancedDirectAdd summary row is missing.",
                 file=sys.stderr,
             )
+            return 1
+        rc_summary = pd.read_csv(summary / "rc_balanced_add_relation_state_delta_summary.csv")
+        if set(rc_summary["rc_balanced_mode"]) != {"rd_only", "hard"}:
+            print("Multi-seed smoke test failed: RC-BalancedAdd modes are wrong.", file=sys.stderr)
+            return 1
+        rc_columns = {
+            "delta_macro_f1_sem",
+            "delta_macro_f1_ci95_low",
+            "delta_macro_f1_ci95_high",
+            "delta_macro_f1_passes_error_control",
+            "rc_alpha_RD_mean",
+        }
+        missing_rc = sorted(rc_columns - set(rc_summary.columns))
+        if missing_rc:
+            print(
+                f"Multi-seed smoke test failed: missing RC-BalancedAdd columns {missing_rc}",
+                file=sys.stderr,
+            )
+            return 1
+        cause_output = root / "v6_cause_analysis"
+        analyze_command = [
+            sys.executable,
+            "-B",
+            str(ANALYZER),
+            "--dataset",
+            "mosi",
+            "--multi_seed_dirs",
+            str(latest),
+            "--output_dir",
+            str(cause_output),
+            "--expected_seeds",
+            "1",
+            "2",
+            "--num_workers",
+            "0",
+            "--device",
+            "cpu",
+        ]
+        analyze_result = subprocess.run(analyze_command, text=True, capture_output=True)
+        print(analyze_result.stdout)
+        if analyze_result.returncode != 0:
+            print(analyze_result.stderr, file=sys.stderr)
+            return analyze_result.returncode
+        cause_required = [
+            "group_cause_profile.csv",
+            "group_cause_profile_all.csv",
+            "group_unimodal_fusion_profile.csv",
+            "group_unimodal_fusion_profile_all.csv",
+            "rd_nd_oracle_profile.csv",
+            "rd_nd_oracle_profile_all.csv",
+            "method_insufficiency_1_15.csv",
+            "method_insufficiency_1_15_all.csv",
+            "v6_cause_analysis_summary.json",
+        ]
+        missing_cause = [name for name in cause_required if not (cause_output / name).exists()]
+        if missing_cause:
+            print(
+                f"Multi-seed smoke test failed: missing cause-analysis outputs {missing_cause}",
+                file=sys.stderr,
+            )
+            return 1
+        cause_profile = pd.read_csv(cause_output / "group_cause_profile.csv")
+        cause_columns = {
+            "avg_abs_label_reg_mean",
+            "label_entropy_mean",
+            "class_0_ratio_mean",
+        }
+        missing_cause_columns = sorted(cause_columns - set(cause_profile.columns))
+        if missing_cause_columns:
+            print(
+                f"Multi-seed smoke test failed: missing cause columns {missing_cause_columns}",
+                file=sys.stderr,
+            )
+            return 1
+        modality_profile = pd.read_csv(cause_output / "group_unimodal_fusion_profile.csv")
+        modality_columns = {
+            "text_macro_f1_mean",
+            "audio_macro_f1_mean",
+            "vision_macro_f1_mean",
+            "fusion_macro_f1_mean",
+            "concat_fusion_macro_f1_mean",
+            "fusion_minus_text_macro_f1_mean",
+        }
+        missing_modality_columns = sorted(modality_columns - set(modality_profile.columns))
+        if missing_modality_columns:
+            print(
+                f"Multi-seed smoke test failed: missing modality columns {missing_modality_columns}",
+                file=sys.stderr,
+            )
+            return 1
+        oracle_profile = pd.read_csv(cause_output / "rd_nd_oracle_profile.csv")
+        if oracle_profile.empty or "oracle_macro_f1_mean" not in oracle_profile.columns:
+            print("Multi-seed smoke test failed: oracle profile is incomplete.", file=sys.stderr)
             return 1
         print(f"Multi-seed smoke test passed. Outputs checked in {summary}")
         return 0

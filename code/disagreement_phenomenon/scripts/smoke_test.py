@@ -161,6 +161,10 @@ def main() -> int:
             "0.05",
             "--direct_add_alpha_values",
             "0.1",
+            "--run_rc_balanced_add",
+            "--rc_balanced_modes",
+            "rd_only",
+            "hard",
             "--run_infonce",
             "--lambda_nce_values",
             "0.01",
@@ -175,6 +179,7 @@ def main() -> int:
             "--run_kernel_dist_diagnostic",
             "--kernel_dist_min_group_size",
             "4",
+            "--run_residual_probe",
             "--patience",
             "2",
         ]
@@ -210,6 +215,11 @@ def main() -> int:
             "balanced_direct_add_delta_metrics.csv",
             "balanced_direct_add_relation_state_delta.csv",
             "balanced_direct_add_model.pt",
+            "rc_balanced_add_valid.csv",
+            "rc_balanced_add_delta_metrics.csv",
+            "rc_balanced_add_relation_state_delta.csv",
+            "rc_balanced_add_rd_only_model.pt",
+            "rc_balanced_add_hard_model.pt",
             "infonce_lambda_sweep_valid.csv",
             "infonce_lambda_test_delta_metrics.csv",
             "infonce_delta_metrics.csv",
@@ -323,6 +333,35 @@ def main() -> int:
         if "BalancedDirectAdd" not in set(group_metrics["method"]):
             print("Smoke test failed: BalancedDirectAdd method row is missing.", file=sys.stderr)
             return 1
+        rc_methods = {"RC-BalancedAdd-RDOnly", "RC-BalancedAdd-Hard"}
+        if not rc_methods.issubset(set(group_metrics["method"])):
+            print("Smoke test failed: RC-BalancedAdd method rows are missing.", file=sys.stderr)
+            return 1
+        rc_delta = pd.read_csv(latest / "rc_balanced_add_delta_metrics.csv")
+        if set(rc_delta["rc_balanced_mode"]) != {"rd_only", "hard"}:
+            print("Smoke test failed: RC-BalancedAdd delta modes are wrong.", file=sys.stderr)
+            return 1
+        rc_required_columns = {
+            "method",
+            "group",
+            "delta_macro_f1",
+            "rc_alpha_RA",
+            "rc_alpha_UA",
+            "rc_alpha_Mid_D",
+            "rc_alpha_RD",
+            "rc_alpha_ND",
+        }
+        missing_rc = sorted(rc_required_columns - set(rc_delta.columns))
+        if missing_rc:
+            print(
+                f"Smoke test failed: missing RC-BalancedAdd columns {missing_rc}",
+                file=sys.stderr,
+            )
+            return 1
+        rc_relation = pd.read_csv(latest / "rc_balanced_add_relation_state_delta.csv")
+        if set(rc_relation["rc_balanced_mode"]) != {"rd_only", "hard"}:
+            print("Smoke test failed: RC-BalancedAdd relation modes are wrong.", file=sys.stderr)
+            return 1
         residual_probe = pd.read_csv(latest / "residual_discriminative_probe.csv")
         residual_columns = {
             "text_anchor_residual_only_macro_f1",
@@ -352,6 +391,10 @@ def main() -> int:
             "vision_acc",
             "fusion_acc",
             "avg_R",
+            "avg_D_sample",
+            "class_0_ratio",
+            "class_1_ratio",
+            "class_2_ratio",
         }
         missing_calibration = sorted(calibration_columns - set(calibration.columns))
         if missing_calibration:
@@ -412,8 +455,12 @@ def main() -> int:
         binary_calibration = pd.read_csv(
             binary_latest / "relation_state_distribution_calibration.csv"
         )
-        if "class_1_ratio" not in binary_calibration.columns:
-            print("Smoke test failed: binary calibration lacks class_1_ratio.", file=sys.stderr)
+        binary_class_columns = {"class_0_ratio", "class_1_ratio"}
+        if not binary_class_columns.issubset(binary_calibration.columns):
+            print("Smoke test failed: binary calibration lacks class ratio columns.", file=sys.stderr)
+            return 1
+        if "class_2_ratio" in binary_calibration.columns:
+            print("Smoke test failed: binary calibration should not emit class_2_ratio.", file=sys.stderr)
             return 1
         print(f"Smoke test passed. Outputs checked in {latest}")
         return 0

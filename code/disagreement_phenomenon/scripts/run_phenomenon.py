@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from src.cli_presets import PRESET_CHOICES, preset_defaults, requested_preset  # noqa: E402
 from src.config import DATASETS, ExperimentConfig  # noqa: E402
 from src.data import MultimodalSplitDataset, infer_input_dims, load_npz_splits  # noqa: E402
 from src.disagreement import (  # noqa: E402
@@ -43,15 +44,44 @@ from src.model import MultimodalClassifier  # noqa: E402
 from src.plotting import save_delta_plot, save_lambda_curve_plot  # noqa: E402
 from src.train import predict, train_model  # noqa: E402
 from src.utils import choose_device, ensure_dir, save_json, set_seed  # noqa: E402
-from src.v4_analysis import (  # noqa: E402
+from src.v6_analysis import (  # noqa: E402
     residual_probe_by_mode_frame,
     residual_probe_frame,
 )
+
+RC_BALANCED_MODE_ALPHAS = {
+    "rd_only": {
+        "RA": 0.0,
+        "UA": 0.0,
+        "Mid-D": 0.0,
+        "RD": 1.0,
+        "ND": 0.0,
+    },
+    "hard": {
+        "RA": 0.3,
+        "UA": 0.1,
+        "Mid-D": 0.3,
+        "RD": 1.0,
+        "ND": 0.1,
+    },
+}
+RC_BALANCED_METHOD_NAMES = {
+    "rd_only": "RC-BalancedAdd-RDOnly",
+    "hard": "RC-BalancedAdd-Hard",
+}
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run the CMU-MOSI/MOSEI disagreement phenomenon experiment."
+    )
+    parser.add_argument(
+        "--preset",
+        choices=PRESET_CHOICES,
+        default="none",
+        help=(
+            "Named default bundle. Explicit CLI arguments still override preset values."
+        ),
     )
     parser.add_argument("--dataset", choices=sorted(DATASETS), required=True)
     parser.add_argument("--data_root", type=Path, default=Path(r"E:\Xu\data\MultiBench"))
@@ -109,13 +139,14 @@ def parse_args() -> argparse.Namespace:
         choices=("text_anchor", "full_pair"),
         default=None,
         help=(
-            "DirectAdd appendix mode. text_anchor is reported as TextInject; "
-            "BalancedDirectAdd is always run as a separate appendix baseline."
+            "DirectAdd diagnostic mode. text_anchor is reported as TextInject; "
+            "BalancedDirectAdd is always run separately as a v6 motivation clue."
         ),
     )
     parser.add_argument(
         "--run_infonce",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=False,
         help="Train unconditional same-sample InfoNCE baselines.",
     )
     parser.add_argument(
@@ -134,7 +165,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--nce_proj_dim", type=int, default=128)
     parser.add_argument(
         "--run_dynamic_fusion",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=False,
         help="Train an EMOE-style DynamicFusion baseline with sample-level modality weights.",
     )
     parser.add_argument(
@@ -155,6 +187,19 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1e-4,
         help="Numerical epsilon for inverse-CE dynamic weight targets.",
+    )
+    parser.add_argument(
+        "--run_rc_balanced_add",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Train v6 relation-conditioned BalancedAdd variants.",
+    )
+    parser.add_argument(
+        "--rc_balanced_modes",
+        choices=tuple(RC_BALANCED_MODE_ALPHAS),
+        nargs="+",
+        default=["rd_only", "hard"],
+        help="v6 RC-BalancedAdd modes to run when --run_rc_balanced_add is set.",
     )
     parser.add_argument(
         "--nce_pair_mode",
@@ -199,7 +244,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--run_kernel_dist_diagnostic",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=False,
         help=(
             "Write prediction-class conditional batch MMD diagnostics for relation states. "
             "This is appendix/motivation analysis only."
@@ -221,6 +267,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--run_residual_probe",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Run appendix residual-probe boundary analysis.",
+    )
+    parser.add_argument(
         "--residual_modes",
         choices=("abs", "signed", "prod", "all"),
         nargs="+",
@@ -236,14 +288,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patience", type=int, default=8)
     parser.add_argument(
         "--deterministic",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=False,
         help="Enable stricter deterministic seeding for lower run-to-run variance.",
     )
     parser.add_argument(
         "--quiet",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=False,
         help="Disable per-epoch tqdm progress bars.",
     )
+    parser.set_defaults(**preset_defaults(requested_preset()))
     args = parser.parse_args()
     resolve_pair_modes(args, parser)
     return args
@@ -383,6 +438,7 @@ def new_model(
     direct_add_alpha: float = 0.0,
     direct_add_pair_mode: str | None = None,
     use_dynamic_fusion: bool = False,
+    use_rc_balanced_add: bool = False,
 ) -> MultimodalClassifier:
     return MultimodalClassifier(
         text_dim=input_dims["text"],
@@ -397,6 +453,7 @@ def new_model(
         nce_proj_dim=cfg.nce_proj_dim,
         use_dynamic_fusion=use_dynamic_fusion,
         dynamic_router_temperature=cfg.dynamic_router_temperature,
+        use_rc_balanced_add=use_rc_balanced_add,
     )
 
 
@@ -674,6 +731,159 @@ def train_best_direct_add(
     )
 
 
+def rc_balanced_method_name(mode: str) -> str:
+    return RC_BALANCED_METHOD_NAMES[mode]
+
+
+def rc_balanced_alpha_from_states(states: np.ndarray, mode: str) -> np.ndarray:
+    if mode not in RC_BALANCED_MODE_ALPHAS:
+        valid = ", ".join(sorted(RC_BALANCED_MODE_ALPHAS))
+        raise ValueError(f"Unknown rc_balanced_mode '{mode}'. Valid choices: {valid}")
+    alpha_by_state = RC_BALANCED_MODE_ALPHAS[mode]
+    return np.asarray([alpha_by_state[str(state)] for state in states], dtype=np.float32)
+
+
+def set_rc_balanced_alpha_for_loaders(
+    loaders: dict[str, DataLoader],
+    relation_states_by_split: dict[str, np.ndarray],
+    mode: str,
+) -> None:
+    for split_name, relation_states in relation_states_by_split.items():
+        dataset = loaders[split_name].dataset
+        if not hasattr(dataset, "set_rc_balanced_alpha"):
+            raise TypeError(f"{split_name} dataset does not support rc_balanced_alpha.")
+        dataset.set_rc_balanced_alpha(rc_balanced_alpha_from_states(relation_states, mode))
+
+
+def rc_balanced_config_row(mode: str) -> dict[str, float | str]:
+    alphas = RC_BALANCED_MODE_ALPHAS[mode]
+    return {
+        "rc_balanced_mode": mode,
+        "method": rc_balanced_method_name(mode),
+        "rc_alpha_RA": alphas["RA"],
+        "rc_alpha_UA": alphas["UA"],
+        "rc_alpha_Mid_D": alphas["Mid-D"],
+        "rc_alpha_RD": alphas["RD"],
+        "rc_alpha_ND": alphas["ND"],
+    }
+
+
+def train_rc_balanced_add_variants(
+    input_dims: dict[str, int],
+    loaders: dict[str, DataLoader],
+    cfg: ExperimentConfig,
+    device: torch.device,
+    concat_grouped: dict[str, dict[str, float]],
+    concat_relation_grouped: dict[str, dict[str, float]],
+    test_groups,
+    test_relation_states: np.ndarray,
+    relation_states_by_split: dict[str, np.ndarray],
+) -> tuple[
+    dict[str, MultimodalClassifier],
+    dict[str, dict[str, float]],
+    dict[str, dict[str, dict[str, float]]],
+    dict[str, dict[str, dict[str, float]]],
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+]:
+    models: dict[str, MultimodalClassifier] = {}
+    valid_by_mode: dict[str, dict[str, float]] = {}
+    grouped_by_mode: dict[str, dict[str, dict[str, float]]] = {}
+    relation_grouped_by_mode: dict[str, dict[str, dict[str, float]]] = {}
+    valid_rows: list[dict[str, object]] = []
+    delta_rows: list[dict[str, object]] = []
+    relation_delta_rows: list[dict[str, object]] = []
+
+    for mode in cfg.rc_balanced_modes:
+        set_rc_balanced_alpha_for_loaders(loaders, relation_states_by_split, mode)
+        reset_training_rng(loaders, cfg)
+        model = new_model(
+            input_dims,
+            cfg,
+            direct_add_alpha=1.0,
+            direct_add_pair_mode="balanced",
+            use_rc_balanced_add=True,
+        )
+        method = rc_balanced_method_name(mode)
+        trained, metrics = train_model(
+            model,
+            loaders["train"],
+            loaders["valid"],
+            device,
+            epochs=cfg.epochs,
+            lr=cfg.lr,
+            weight_decay=cfg.weight_decay,
+            eta_unimodal=0.0,
+            lambda_align=0.0,
+            patience=cfg.patience,
+            desc=method,
+            show_progress=not cfg.quiet,
+        )
+        pred = predict(trained, loaders["test"], device)
+        grouped = grouped_metrics(pred["y_true"], pred["y_pred"], test_groups)
+        relation_grouped = grouped_metrics(
+            pred["y_true"],
+            pred["y_pred"],
+            test_relation_states,
+            group_order=RELATION_STATE_GROUP_ORDER,
+            include_overall=False,
+        )
+
+        config_row = rc_balanced_config_row(mode)
+        valid_rows.append({**config_row, **metrics})
+        for group in ("Low-D", "Mid-D", "High-D", "Overall"):
+            delta_rows.append(
+                {
+                    **config_row,
+                    "group": group,
+                    "n": grouped[group]["n"],
+                    "concat_acc": concat_grouped[group]["acc"],
+                    "rc_balanced_add_acc": grouped[group]["acc"],
+                    "delta_acc": grouped[group]["acc"] - concat_grouped[group]["acc"],
+                    "concat_macro_f1": concat_grouped[group]["macro_f1"],
+                    "rc_balanced_add_macro_f1": grouped[group]["macro_f1"],
+                    "delta_macro_f1": grouped[group]["macro_f1"]
+                    - concat_grouped[group]["macro_f1"],
+                    "valid_macro_f1": metrics.get("macro_f1"),
+                    "valid_acc": metrics.get("acc"),
+                }
+            )
+        for group in RELATION_STATE_GROUP_ORDER:
+            relation_delta_rows.append(
+                {
+                    **config_row,
+                    "group": group,
+                    "n": relation_grouped[group]["n"],
+                    "concat_acc": concat_relation_grouped[group]["acc"],
+                    "rc_balanced_add_acc": relation_grouped[group]["acc"],
+                    "delta_acc": relation_grouped[group]["acc"]
+                    - concat_relation_grouped[group]["acc"],
+                    "concat_macro_f1": concat_relation_grouped[group]["macro_f1"],
+                    "rc_balanced_add_macro_f1": relation_grouped[group]["macro_f1"],
+                    "delta_macro_f1": relation_grouped[group]["macro_f1"]
+                    - concat_relation_grouped[group]["macro_f1"],
+                    "valid_macro_f1": metrics.get("macro_f1"),
+                    "valid_acc": metrics.get("acc"),
+                }
+            )
+
+        models[mode] = trained
+        valid_by_mode[mode] = metrics
+        grouped_by_mode[mode] = grouped
+        relation_grouped_by_mode[mode] = relation_grouped
+
+    return (
+        models,
+        valid_by_mode,
+        grouped_by_mode,
+        relation_grouped_by_mode,
+        pd.DataFrame(valid_rows),
+        pd.DataFrame(delta_rows),
+        pd.DataFrame(relation_delta_rows),
+    )
+
+
 def train_best_dynamic_fusion(
     input_dims: dict[str, int],
     loaders: dict[str, DataLoader],
@@ -941,10 +1151,12 @@ def relation_state_split(
 def relation_state_calibration_frame(
     pred: dict[str, np.ndarray],
     relation_states: np.ndarray,
+    disagreement: np.ndarray,
     reliability: dict[str, np.ndarray],
     *,
     label_mode: str,
     relation_split: str,
+    num_classes: int,
 ) -> pd.DataFrame:
     y_true = pred["y_true"]
     modality_preds = {
@@ -954,7 +1166,6 @@ def relation_state_calibration_frame(
         "fusion_acc": pred["prob_f"].argmax(axis=1),
     }
     rows: list[dict[str, object]] = []
-    classes = sorted(int(label) for label in np.unique(y_true))
     for group in RELATION_STATE_GROUP_ORDER:
         mask = relation_states == group
         n = int(mask.sum())
@@ -970,12 +1181,13 @@ def relation_state_calibration_frame(
             "label_mode": label_mode,
             "relation_split": relation_split,
             "n": n,
+            "avg_D_sample": float(np.mean(disagreement[mask])) if n else float("nan"),
             "avg_R": float(np.mean(reliability["R_sample"][mask])) if n else float("nan"),
             "avg_R_text": float(np.mean(reliability["R_text"][mask])) if n else float("nan"),
             "avg_R_audio": float(np.mean(reliability["R_audio"][mask])) if n else float("nan"),
             "avg_R_vision": float(np.mean(reliability["R_vision"][mask])) if n else float("nan"),
         }
-        for label in classes:
+        for label in range(num_classes):
             row[f"class_{label}_ratio"] = (
                 float((y_true[mask] == label).mean()) if n else float("nan")
             )
@@ -1030,6 +1242,7 @@ def main() -> int:
         dataset=args.dataset,
         data_root=args.data_root,
         output_root=args.output_root,
+        preset=args.preset,
         seed=args.seed,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
@@ -1055,6 +1268,8 @@ def main() -> int:
         lambda_dynamic_weight_values=args.lambda_dynamic_weight_values,
         dynamic_router_temperature=args.dynamic_router_temperature,
         dynamic_weight_epsilon=args.dynamic_weight_epsilon,
+        run_rc_balanced_add=args.run_rc_balanced_add,
+        rc_balanced_modes=args.rc_balanced_modes,
         disagreement_metric=args.disagreement_metric,
         disagreement_pair_mode=args.disagreement_pair_mode,
         kernel_bandwidth=args.kernel_bandwidth,
@@ -1064,6 +1279,7 @@ def main() -> int:
         run_kernel_dist_diagnostic=args.run_kernel_dist_diagnostic,
         kernel_dist_min_group_size=args.kernel_dist_min_group_size,
         relation_split=args.relation_split,
+        run_residual_probe=args.run_residual_probe,
         residual_modes=args.residual_modes,
         tau_agreement=args.tau_agreement,
         patience=args.patience,
@@ -1100,6 +1316,7 @@ def main() -> int:
     save_json(
         run_dir / "config.json",
         {
+            "preset": cfg.preset,
             "dataset": cfg.dataset,
             "data_path": str(cfg.data_path),
             "seed": cfg.seed,
@@ -1124,6 +1341,15 @@ def main() -> int:
             "nce_pair_mode": cfg.nce_pair_mode,
             "use_nce_projection": cfg.use_nce_projection,
             "nce_proj_dim": cfg.nce_proj_dim,
+            "run_dynamic_fusion": cfg.run_dynamic_fusion,
+            "lambda_dynamic_weight_values": cfg.lambda_dynamic_weight_values,
+            "dynamic_router_temperature": cfg.dynamic_router_temperature,
+            "dynamic_weight_epsilon": cfg.dynamic_weight_epsilon,
+            "run_rc_balanced_add": cfg.run_rc_balanced_add,
+            "rc_balanced_modes": cfg.rc_balanced_modes,
+            "rc_balanced_mode_alphas": {
+                mode: RC_BALANCED_MODE_ALPHAS[mode] for mode in cfg.rc_balanced_modes
+            },
             "disagreement_metric": cfg.disagreement_metric,
             "disagreement_pair_mode": cfg.disagreement_pair_mode,
             "kernel_bandwidth": cfg.kernel_bandwidth,
@@ -1133,6 +1359,7 @@ def main() -> int:
             "run_kernel_dist_diagnostic": cfg.run_kernel_dist_diagnostic,
             "kernel_dist_min_group_size": cfg.kernel_dist_min_group_size,
             "relation_split": cfg.relation_split,
+            "run_residual_probe": cfg.run_residual_probe,
             "residual_modes": cfg.residual_modes,
             "tau_agreement": cfg.tau_agreement,
             "deterministic": cfg.deterministic,
@@ -1271,9 +1498,11 @@ def main() -> int:
     calibration_df = relation_state_calibration_frame(
         test_diag,
         test_relation_states,
+        test_d,
         test_reliability,
         label_mode=cfg.label_mode,
         relation_split=cfg.relation_split,
+        num_classes=cfg.num_classes,
     )
     calibration_df.to_csv(
         run_dir / "relation_state_distribution_calibration.csv",
@@ -1342,31 +1571,34 @@ def main() -> int:
             encoding="utf-8-sig",
         )
 
-    residual_probe_df = residual_probe_frame(
-        train_diag,
-        test_diag,
-        train_relation_states,
-        test_relation_states,
-        cfg.seed,
-    )
-    residual_probe_df.to_csv(
-        run_dir / "residual_discriminative_probe.csv",
-        index=False,
-        encoding="utf-8-sig",
-    )
-    residual_probe_by_mode_df = residual_probe_by_mode_frame(
-        train_diag,
-        test_diag,
-        train_relation_states,
-        test_relation_states,
-        cfg.seed,
-        residual_modes=cfg.residual_modes,
-    )
-    residual_probe_by_mode_df.to_csv(
-        run_dir / "residual_probe_by_mode.csv",
-        index=False,
-        encoding="utf-8-sig",
-    )
+    residual_probe_df = pd.DataFrame()
+    residual_probe_by_mode_df = pd.DataFrame()
+    if cfg.run_residual_probe:
+        residual_probe_df = residual_probe_frame(
+            train_diag,
+            test_diag,
+            train_relation_states,
+            test_relation_states,
+            cfg.seed,
+        )
+        residual_probe_df.to_csv(
+            run_dir / "residual_discriminative_probe.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        residual_probe_by_mode_df = residual_probe_by_mode_frame(
+            train_diag,
+            test_diag,
+            train_relation_states,
+            test_relation_states,
+            cfg.seed,
+            residual_modes=cfg.residual_modes,
+        )
+        residual_probe_by_mode_df.to_csv(
+            run_dir / "residual_probe_by_mode.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
 
     concat_model, concat_valid = train_concat(input_dims, loaders, cfg, device)
     concat_pred = predict(concat_model, loaders["test"], device)
@@ -1518,6 +1750,54 @@ def main() -> int:
         index=False,
         encoding="utf-8-sig",
     )
+
+    rc_balanced_add_models: dict[str, MultimodalClassifier] = {}
+    rc_balanced_add_valid: dict[str, dict[str, float]] = {}
+    rc_balanced_add_grouped: dict[str, dict[str, dict[str, float]]] = {}
+    rc_balanced_add_relation_grouped: dict[str, dict[str, dict[str, float]]] = {}
+    rc_balanced_add_valid_df = pd.DataFrame()
+    rc_balanced_add_delta_df = pd.DataFrame()
+    rc_balanced_add_relation_delta_df = pd.DataFrame()
+    if cfg.run_rc_balanced_add:
+        relation_states_by_split = {
+            "train": train_relation_states,
+            "valid": valid_relation_states,
+            "test": test_relation_states,
+        }
+        (
+            rc_balanced_add_models,
+            rc_balanced_add_valid,
+            rc_balanced_add_grouped,
+            rc_balanced_add_relation_grouped,
+            rc_balanced_add_valid_df,
+            rc_balanced_add_delta_df,
+            rc_balanced_add_relation_delta_df,
+        ) = train_rc_balanced_add_variants(
+            input_dims,
+            loaders,
+            cfg,
+            device,
+            concat_grouped,
+            concat_relation_grouped,
+            test_groups,
+            test_relation_states,
+            relation_states_by_split,
+        )
+        rc_balanced_add_valid_df.to_csv(
+            run_dir / "rc_balanced_add_valid.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        rc_balanced_add_delta_df.to_csv(
+            run_dir / "rc_balanced_add_delta_metrics.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        rc_balanced_add_relation_delta_df.to_csv(
+            run_dir / "rc_balanced_add_relation_state_delta.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
 
     dynamic_fusion_model = None
     dynamic_fusion_valid = None
@@ -1729,6 +2009,18 @@ def main() -> int:
         row["direct_add_alpha"] = best_balanced_direct_add_alpha
         row["direct_add_pair_mode"] = "balanced"
     relation_state_rows.extend(balanced_direct_add_relation_rows)
+    if cfg.run_rc_balanced_add:
+        for mode, grouped in rc_balanced_add_relation_grouped.items():
+            rc_relation_rows = rows_for_method(
+                rc_balanced_method_name(mode),
+                grouped,
+                group_order=RELATION_STATE_GROUP_ORDER,
+                include_overall=False,
+            )
+            config_row = rc_balanced_config_row(mode)
+            for row in rc_relation_rows:
+                row.update(config_row)
+            relation_state_rows.extend(rc_relation_rows)
     if cfg.run_dynamic_fusion and dynamic_fusion_relation_grouped is not None:
         dynamic_fusion_relation_rows = rows_for_method(
             "DynamicFusion",
@@ -1877,9 +2169,11 @@ def main() -> int:
             index=False,
             encoding="utf-8-sig",
         )
-    probe_by_group = {
-        str(row["group"]): row for _, row in residual_probe_df.iterrows()
-    }
+    probe_by_group = (
+        {str(row["group"]): row for _, row in residual_probe_df.iterrows()}
+        if not residual_probe_df.empty
+        else {}
+    )
     concat_aware_rows = []
     for group in RELATION_STATE_GROUP_ORDER:
         probe_row = probe_by_group.get(group, {})
@@ -1892,6 +2186,10 @@ def main() -> int:
                 "balanced_direct_add_macro_f1": balanced_direct_add_relation_grouped[
                     group
                 ]["macro_f1"],
+                **{
+                    f"rc_balanced_{mode}_macro_f1": grouped[group]["macro_f1"]
+                    for mode, grouped in rc_balanced_add_relation_grouped.items()
+                },
                 "dynamic_fusion_macro_f1": (
                     dynamic_fusion_relation_grouped[group]["macro_f1"]
                     if dynamic_fusion_relation_grouped is not None
@@ -1983,6 +2281,13 @@ def main() -> int:
         row["direct_add_alpha"] = best_balanced_direct_add_alpha
         row["direct_add_pair_mode"] = "balanced"
     rows.extend(balanced_direct_add_rows)
+    if cfg.run_rc_balanced_add:
+        for mode, grouped in rc_balanced_add_grouped.items():
+            rc_rows = rows_for_method(rc_balanced_method_name(mode), grouped)
+            config_row = rc_balanced_config_row(mode)
+            for row in rc_rows:
+                row.update(config_row)
+            rows.extend(rc_rows)
     if cfg.run_dynamic_fusion and dynamic_fusion_grouped is not None:
         dynamic_fusion_rows = rows_for_method("DynamicFusion", dynamic_fusion_grouped)
         for row in dynamic_fusion_rows:
@@ -2108,6 +2413,8 @@ def main() -> int:
         balanced_direct_add_model.state_dict(),
         run_dir / "balanced_direct_add_model.pt",
     )
+    for mode, model in rc_balanced_add_models.items():
+        torch.save(model.state_dict(), run_dir / f"rc_balanced_add_{mode}_model.pt")
     if cfg.run_dynamic_fusion and dynamic_fusion_model is not None:
         torch.save(dynamic_fusion_model.state_dict(), run_dir / "dynamic_fusion_model.pt")
     if cfg.run_infonce and infonce_model is not None:
@@ -2115,6 +2422,7 @@ def main() -> int:
     save_json(
         run_dir / "summary.json",
         {
+            "preset": cfg.preset,
             "diagnostic_valid": diagnostic_valid,
             "concat_valid": concat_valid,
             "uncond_align_valid": align_valid,
@@ -2128,6 +2436,12 @@ def main() -> int:
             "direct_add_pair_mode": cfg.direct_add_pair_mode,
             "balanced_direct_add_valid": balanced_direct_add_valid,
             "best_balanced_direct_add_alpha": best_balanced_direct_add_alpha,
+            "run_rc_balanced_add": cfg.run_rc_balanced_add,
+            "rc_balanced_modes": cfg.rc_balanced_modes,
+            "rc_balanced_add_valid": rc_balanced_add_valid,
+            "rc_balanced_mode_alphas": {
+                mode: RC_BALANCED_MODE_ALPHAS[mode] for mode in cfg.rc_balanced_modes
+            },
             "run_dynamic_fusion": cfg.run_dynamic_fusion,
             "dynamic_fusion_valid": dynamic_fusion_valid,
             "best_lambda_dynamic_weight": best_lambda_dynamic_weight,
@@ -2150,6 +2464,7 @@ def main() -> int:
             "kernel_dist_min_group_size": cfg.kernel_dist_min_group_size,
             "kernel_dist_bandwidth": kernel_dist_bandwidth,
             "relation_split": cfg.relation_split,
+            "run_residual_probe": cfg.run_residual_probe,
             "residual_modes": cfg.residual_modes,
             "resolved_kernel_bandwidth": resolved_kernel_bandwidth
             if cfg.disagreement_metric == "kernel_mmd"
@@ -2179,6 +2494,9 @@ def main() -> int:
     print(direct_add_delta_df.to_string(index=False))
     print("\nBalancedDirectAdd delta metrics:")
     print(balanced_direct_add_delta_df.to_string(index=False))
+    if cfg.run_rc_balanced_add:
+        print("\nRC-BalancedAdd delta metrics:")
+        print(rc_balanced_add_delta_df.to_string(index=False))
     if cfg.run_dynamic_fusion:
         print("\nDynamicFusion delta metrics:")
         print(dynamic_fusion_delta_df.to_string(index=False))
@@ -2200,6 +2518,9 @@ def main() -> int:
     print(direct_add_relation_state_delta_df.to_string(index=False))
     print("\nBalancedDirectAdd relation-state delta metrics:")
     print(balanced_direct_add_relation_state_delta_df.to_string(index=False))
+    if cfg.run_rc_balanced_add:
+        print("\nRC-BalancedAdd relation-state delta metrics:")
+        print(rc_balanced_add_relation_delta_df.to_string(index=False))
     if cfg.run_dynamic_fusion:
         print("\nDynamicFusion relation-state delta metrics:")
         print(dynamic_fusion_relation_delta_df.to_string(index=False))

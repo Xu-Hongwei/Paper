@@ -51,6 +51,7 @@ class ExperimentConfig:
         dataset: 数据集名称（"mosi" 或 "mosei"）。
         data_root: 数据根目录。
         output_root: 输出根目录。
+        preset: CLI 预设名称；"none" 表示未使用预设。
         seed: 随机种子。
         batch_size: 批次大小。
         epochs: 最大训练轮数。
@@ -91,6 +92,7 @@ class ExperimentConfig:
     dataset: str
     data_root: Path
     output_root: Path
+    preset: str = "none"
     seed: int = 42
     batch_size: int = 64
     epochs: int = 30
@@ -121,6 +123,8 @@ class ExperimentConfig:
     )
     dynamic_router_temperature: float = 0.1
     dynamic_weight_epsilon: float = 1e-4
+    run_rc_balanced_add: bool = False
+    rc_balanced_modes: list[str] = field(default_factory=lambda: ["rd_only", "hard"])
     disagreement_metric: str = "prob_jsd"
     disagreement_pair_mode: str = "text_anchor"
     kernel_bandwidth: str = "median"
@@ -130,6 +134,7 @@ class ExperimentConfig:
     run_kernel_dist_diagnostic: bool = False
     kernel_dist_min_group_size: int = 10
     relation_split: str = "balanced_within_d"
+    run_residual_probe: bool = False
     residual_modes: list[str] = field(default_factory=lambda: ["abs", "signed", "prod", "all"])
     tau_agreement: float = 0.1
     patience: int = 8

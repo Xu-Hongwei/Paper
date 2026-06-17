@@ -125,6 +125,7 @@ class MultimodalClassifier(nn.Module):
         nce_proj_dim: int = 128,
         use_dynamic_fusion: bool = False,
         dynamic_router_temperature: float = 0.1,
+        use_rc_balanced_add: bool = False,
     ) -> None:
         """初始化多模态分类器。
 
@@ -144,6 +145,8 @@ class MultimodalClassifier(nn.Module):
             nce_proj_dim: InfoNCE 投影维度。
             use_dynamic_fusion: 是否使用 EMOE-style 样本级动态模态加权融合。
             dynamic_router_temperature: 动态融合 router 的 softmax 温度。
+            use_rc_balanced_add: 是否使用 batch 中的样本级 rc_balanced_alpha
+                缩放 balanced DirectAdd 注入。
 
         Raises:
             ValueError: direct_add_pair_mode 不合法时抛出。
@@ -157,6 +160,7 @@ class MultimodalClassifier(nn.Module):
         self.direct_add_pair_mode = direct_add_pair_mode
         self.use_nce_projection = use_nce_projection
         self.use_dynamic_fusion = use_dynamic_fusion
+        self.use_rc_balanced_add = use_rc_balanced_add
         self.text_encoder = ModalityEncoder(text_dim, hidden_dim, dropout)
         self.vision_encoder = ModalityEncoder(vision_dim, hidden_dim, dropout)
         self.audio_encoder = ModalityEncoder(audio_dim, hidden_dim, dropout)
@@ -235,9 +239,17 @@ class MultimodalClassifier(nn.Module):
                     + self.add_norm_v(enc["vision"])
                     + self.add_norm_a(enc["audio"])
                 ) / 3.0
-                fuse_text = fuse_text + self.direct_add_alpha * aligned
-                fuse_vision = fuse_vision + self.direct_add_alpha * aligned
-                fuse_audio = fuse_audio + self.direct_add_alpha * aligned
+                alpha: float | torch.Tensor = self.direct_add_alpha
+                if self.use_rc_balanced_add:
+                    if "rc_balanced_alpha" not in batch:
+                        raise ValueError(
+                            "RC-BalancedAdd requires batch['rc_balanced_alpha']."
+                        )
+                    alpha = self.direct_add_alpha * batch["rc_balanced_alpha"].view(-1, 1)
+                    alpha = alpha.to(dtype=aligned.dtype)
+                fuse_text = fuse_text + alpha * aligned
+                fuse_vision = fuse_vision + alpha * aligned
+                fuse_audio = fuse_audio + alpha * aligned
             else:
                 aligned = (enc["text"] + enc["vision"] + enc["audio"]) / 3.0
                 fuse_text = fuse_text + self.direct_add_alpha * aligned

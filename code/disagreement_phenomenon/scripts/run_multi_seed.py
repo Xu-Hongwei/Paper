@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from src.cli_presets import PRESET_CHOICES, preset_defaults, requested_preset  # noqa: E402
 from src.config import DATASETS  # noqa: E402
 from src.disagreement import HIGH_D_RELIABILITY_GROUP_ORDER, RELATION_STATE_GROUP_ORDER  # noqa: E402
 from src.plotting import (  # noqa: E402
@@ -25,11 +26,24 @@ from src.plotting import (  # noqa: E402
 from src.utils import ensure_dir, save_json  # noqa: E402
 
 RUNNER = ROOT / "scripts" / "run_phenomenon.py"
+RC_BALANCED_MODES = ("rd_only", "hard")
+RC_BALANCED_METHOD_NAMES = {
+    "rd_only": "RC-BalancedAdd-RDOnly",
+    "hard": "RC-BalancedAdd-Hard",
+}
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run disagreement phenomenon experiment across multiple seeds."
+    )
+    parser.add_argument(
+        "--preset",
+        choices=PRESET_CHOICES,
+        default="none",
+        help=(
+            "Named default bundle. Explicit CLI arguments still override preset values."
+        ),
     )
     parser.add_argument("--dataset", choices=sorted(DATASETS), required=True)
     parser.add_argument("--data_root", type=Path, default=Path(r"E:\Xu\data\MultiBench"))
@@ -80,13 +94,14 @@ def parse_args() -> argparse.Namespace:
         choices=("text_anchor", "full_pair"),
         default=None,
         help=(
-            "DirectAdd appendix mode. text_anchor is reported as TextInject; "
-            "BalancedDirectAdd is always run as a separate appendix baseline."
+            "DirectAdd diagnostic mode. text_anchor is reported as TextInject; "
+            "BalancedDirectAdd is always run separately as a v6 motivation clue."
         ),
     )
     parser.add_argument(
         "--run_infonce",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=False,
         help="Train and aggregate unconditional InfoNCE baselines.",
     )
     parser.add_argument(
@@ -105,7 +120,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--nce_proj_dim", type=int, default=128)
     parser.add_argument(
         "--run_dynamic_fusion",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=False,
         help="Train and aggregate EMOE-style DynamicFusion baselines.",
     )
     parser.add_argument(
@@ -116,6 +132,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dynamic_router_temperature", type=float, default=0.1)
     parser.add_argument("--dynamic_weight_epsilon", type=float, default=1e-4)
+    parser.add_argument(
+        "--run_rc_balanced_add",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Train and aggregate v6 relation-conditioned BalancedAdd variants.",
+    )
+    parser.add_argument(
+        "--rc_balanced_modes",
+        choices=RC_BALANCED_MODES,
+        nargs="+",
+        default=["rd_only", "hard"],
+    )
     parser.add_argument(
         "--nce_pair_mode",
         choices=("text_anchor", "full_pair"),
@@ -144,7 +172,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kernel_max_class_samples", type=int, default=1024)
     parser.add_argument(
         "--run_kernel_dist_diagnostic",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=False,
         help="Aggregate prediction-class conditional batch MMD relation diagnostics.",
     )
     parser.add_argument(
@@ -157,6 +186,12 @@ def parse_args() -> argparse.Namespace:
         "--relation_split",
         choices=("balanced_within_d", "global_r"),
         default="balanced_within_d",
+    )
+    parser.add_argument(
+        "--run_residual_probe",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Run and aggregate appendix residual-probe boundary analysis.",
     )
     parser.add_argument(
         "--residual_modes",
@@ -173,7 +208,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patience", type=int, default=8)
     parser.add_argument(
         "--deterministic",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=False,
         help="Pass deterministic seeding controls to each single-seed run.",
     )
     parser.add_argument(
@@ -190,9 +226,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--quiet",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=False,
         help="Pass --quiet to each single-seed run.",
     )
+    parser.set_defaults(**preset_defaults(requested_preset()))
     args = parser.parse_args()
     resolve_pair_modes(args, parser)
     return args
@@ -394,7 +432,7 @@ def numeric_value_columns(frame: pd.DataFrame, exclude: set[str]) -> list[str]:
     return value_cols
 
 
-def write_conclusion(delta_summary: pd.DataFrame, path: Path) -> None:
+def write_uncond_align_delta_conclusion(delta_summary: pd.DataFrame, path: Path) -> None:
     by_group = {row["group"]: row for _, row in delta_summary.iterrows()}
     high = by_group.get("High-D")
     low = by_group.get("Low-D")
@@ -410,6 +448,71 @@ def write_conclusion(delta_summary: pd.DataFrame, path: Path) -> None:
         "high_d_more_harmful_than_mid_d": False
         if high is None or mid is None
         else high["delta_macro_f1_mean"] < mid["delta_macro_f1_mean"],
+    }
+    save_json(path, payload)
+
+
+def write_experiment_one_conclusion(
+    group_metrics_all: pd.DataFrame,
+    group_metrics_summary: pd.DataFrame,
+    path: Path,
+) -> None:
+    concat_all = group_metrics_all[
+        (group_metrics_all["method"] == "Concat")
+        & (group_metrics_all["group"].isin(["Low-D", "Mid-D", "High-D"]))
+    ]
+    concat_summary = group_metrics_summary[
+        (group_metrics_summary["method"] == "Concat")
+        & (group_metrics_summary["group"].isin(["Low-D", "Mid-D", "High-D"]))
+    ]
+    by_group = {row["group"]: row for _, row in concat_summary.iterrows()}
+    pivot = concat_all.pivot_table(
+        index="seed",
+        columns="group",
+        values="macro_f1",
+        aggfunc="first",
+    )
+    required = ["Low-D", "Mid-D", "High-D"]
+    if all(column in pivot.columns for column in required):
+        consistency = (pivot["High-D"] > pivot["Mid-D"]) & (
+            pivot["Mid-D"] > pivot["Low-D"]
+        )
+        seed_records = [
+            {
+                "seed": int(seed),
+                "low_d_macro_f1": float(row["Low-D"]),
+                "mid_d_macro_f1": float(row["Mid-D"]),
+                "high_d_macro_f1": float(row["High-D"]),
+                "high_gt_mid_gt_low": bool(consistency.loc[seed]),
+            }
+            for seed, row in pivot.iterrows()
+        ]
+        consistency_count = int(consistency.sum())
+        seed_count = int(consistency.shape[0])
+    else:
+        seed_records = []
+        consistency_count = 0
+        seed_count = 0
+
+    payload = {
+        "claim": "high_d_is_not_difficulty_under_concat",
+        "concat_macro_f1_mean": {
+            group: None
+            if group not in by_group
+            else float(by_group[group]["macro_f1_mean"])
+            for group in required
+        },
+        "concat_acc_mean": {
+            group: None if group not in by_group else float(by_group[group]["acc_mean"])
+            for group in required
+        },
+        "seed_count": seed_count,
+        "high_gt_mid_gt_low_count": consistency_count,
+        "high_gt_mid_gt_low_rate": (
+            float(consistency_count / seed_count) if seed_count else None
+        ),
+        "high_gt_mid_gt_low_all_seeds": bool(seed_count > 0 and consistency_count == seed_count),
+        "per_seed": seed_records,
     }
     save_json(path, payload)
 
@@ -515,6 +618,16 @@ def run_one_seed(args: argparse.Namespace, run_root: Path, seed: int, seen: set[
                 str(args.dynamic_weight_epsilon),
             ]
         )
+    if args.run_rc_balanced_add:
+        command.extend(
+            [
+                "--run_rc_balanced_add",
+                "--rc_balanced_modes",
+                *args.rc_balanced_modes,
+            ]
+        )
+    if args.run_residual_probe:
+        command.append("--run_residual_probe")
     if args.quiet:
         command.append("--quiet")
     print(f"\n=== Running seed {seed} ===")
@@ -537,6 +650,7 @@ def main() -> int:
     save_json(
         summary_dir / "multi_seed_config.json",
         {
+            "preset": args.preset,
             "dataset": args.dataset,
             "data_root": str(args.data_root),
             "seeds": args.seeds,
@@ -564,6 +678,8 @@ def main() -> int:
             "lambda_dynamic_weight_values": args.lambda_dynamic_weight_values,
             "dynamic_router_temperature": args.dynamic_router_temperature,
             "dynamic_weight_epsilon": args.dynamic_weight_epsilon,
+            "run_rc_balanced_add": args.run_rc_balanced_add,
+            "rc_balanced_modes": args.rc_balanced_modes,
             "disagreement_metric": args.disagreement_metric,
             "disagreement_pair_mode": args.disagreement_pair_mode,
             "kernel_bandwidth": args.kernel_bandwidth,
@@ -573,6 +689,7 @@ def main() -> int:
             "run_kernel_dist_diagnostic": args.run_kernel_dist_diagnostic,
             "kernel_dist_min_group_size": args.kernel_dist_min_group_size,
             "relation_split": args.relation_split,
+            "run_residual_probe": args.run_residual_probe,
             "residual_modes": args.residual_modes,
             "tau_agreement": args.tau_agreement,
             "patience": args.patience,
@@ -615,9 +732,23 @@ def main() -> int:
         run_dirs,
         "balanced_direct_add_relation_state_delta.csv",
     )
+    rc_balanced_add_delta_all = pd.DataFrame()
+    rc_balanced_add_relation_state_delta_all = pd.DataFrame()
+    if args.run_rc_balanced_add:
+        rc_balanced_add_delta_all = read_seed_csv(
+            run_dirs,
+            "rc_balanced_add_delta_metrics.csv",
+        )
+        rc_balanced_add_relation_state_delta_all = read_seed_csv(
+            run_dirs,
+            "rc_balanced_add_relation_state_delta.csv",
+        )
     concat_aware_all = read_seed_csv(run_dirs, "concat_aware_motivation.csv")
-    residual_probe_all = read_seed_csv(run_dirs, "residual_discriminative_probe.csv")
-    residual_probe_by_mode_all = read_seed_csv(run_dirs, "residual_probe_by_mode.csv")
+    residual_probe_all = pd.DataFrame()
+    residual_probe_by_mode_all = pd.DataFrame()
+    if args.run_residual_probe:
+        residual_probe_all = read_seed_csv(run_dirs, "residual_discriminative_probe.csv")
+        residual_probe_by_mode_all = read_seed_csv(run_dirs, "residual_probe_by_mode.csv")
     calibration_all = read_seed_csv(run_dirs, "relation_state_distribution_calibration.csv")
     kernel_distribution_metrics_all = pd.DataFrame()
     kernel_distribution_summary_all = pd.DataFrame()
@@ -740,21 +871,33 @@ def main() -> int:
         index=False,
         encoding="utf-8-sig",
     )
+    if args.run_rc_balanced_add:
+        rc_balanced_add_delta_all.to_csv(
+            summary_dir / "rc_balanced_add_delta_all.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        rc_balanced_add_relation_state_delta_all.to_csv(
+            summary_dir / "rc_balanced_add_relation_state_delta_all.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
     concat_aware_all.to_csv(
         summary_dir / "concat_aware_motivation_all.csv",
         index=False,
         encoding="utf-8-sig",
     )
-    residual_probe_all.to_csv(
-        summary_dir / "residual_discriminative_probe_all.csv",
-        index=False,
-        encoding="utf-8-sig",
-    )
-    residual_probe_by_mode_all.to_csv(
-        summary_dir / "residual_probe_by_mode_all.csv",
-        index=False,
-        encoding="utf-8-sig",
-    )
+    if args.run_residual_probe:
+        residual_probe_all.to_csv(
+            summary_dir / "residual_discriminative_probe_all.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        residual_probe_by_mode_all.to_csv(
+            summary_dir / "residual_probe_by_mode_all.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
     calibration_all.to_csv(
         summary_dir / "relation_state_distribution_calibration_all.csv",
         index=False,
@@ -915,6 +1058,41 @@ def main() -> int:
         min_count=args.error_min_seeds,
         sign_rate_threshold=args.error_sign_rate,
     )
+    rc_balanced_add_delta_summary = pd.DataFrame()
+    rc_balanced_add_relation_state_summary = pd.DataFrame()
+    if args.run_rc_balanced_add:
+        rc_balanced_add_delta_summary = flatten_summary(
+            rc_balanced_add_delta_all,
+            ["rc_balanced_mode", "method", "group"],
+            [
+                "delta_acc",
+                "delta_macro_f1",
+                "rc_alpha_RA",
+                "rc_alpha_UA",
+                "rc_alpha_Mid_D",
+                "rc_alpha_RD",
+                "rc_alpha_ND",
+            ],
+            sign_cols=["delta_acc", "delta_macro_f1"],
+            min_count=args.error_min_seeds,
+            sign_rate_threshold=args.error_sign_rate,
+        )
+        rc_balanced_add_relation_state_summary = flatten_summary(
+            rc_balanced_add_relation_state_delta_all,
+            ["rc_balanced_mode", "method", "group"],
+            [
+                "delta_acc",
+                "delta_macro_f1",
+                "rc_alpha_RA",
+                "rc_alpha_UA",
+                "rc_alpha_Mid_D",
+                "rc_alpha_RD",
+                "rc_alpha_ND",
+            ],
+            sign_cols=["delta_acc", "delta_macro_f1"],
+            min_count=args.error_min_seeds,
+            sign_rate_threshold=args.error_sign_rate,
+        )
     dynamic_fusion_delta_summary = pd.DataFrame()
     dynamic_fusion_relation_state_summary = pd.DataFrame()
     dynamic_fusion_lambda_delta_summary = pd.DataFrame()
@@ -990,41 +1168,44 @@ def main() -> int:
             "lambda_nce",
         ],
     )
-    residual_probe_summary = flatten_summary(
-        residual_probe_all,
-        ["group"],
-        [
-            "train_n",
-            "test_n",
-            "common_only_macro_f1",
-            "residual_only_macro_f1",
-            "common_residual_macro_f1",
-            "residual_gain_macro_f1",
-            "shuffled_residual_only_macro_f1",
-            "text_anchor_residual_only_macro_f1",
-            "text_anchor_common_residual_macro_f1",
-            "text_anchor_residual_gain_macro_f1",
-            "text_anchor_shuffled_residual_macro_f1",
-            "common_shuffled_residual_macro_f1",
-            "residual_gain_vs_feature_shuffle_macro_f1",
-            "text_anchor_common_shuffled_residual_macro_f1",
-            "text_anchor_residual_gain_vs_feature_shuffle_macro_f1",
-        ],
-    )
-    residual_probe_by_mode_summary = flatten_summary(
-        residual_probe_by_mode_all,
-        ["group", "residual_scope", "residual_mode"],
-        numeric_value_columns(
+    residual_probe_summary = pd.DataFrame()
+    residual_probe_by_mode_summary = pd.DataFrame()
+    if args.run_residual_probe:
+        residual_probe_summary = flatten_summary(
+            residual_probe_all,
+            ["group"],
+            [
+                "train_n",
+                "test_n",
+                "common_only_macro_f1",
+                "residual_only_macro_f1",
+                "common_residual_macro_f1",
+                "residual_gain_macro_f1",
+                "shuffled_residual_only_macro_f1",
+                "text_anchor_residual_only_macro_f1",
+                "text_anchor_common_residual_macro_f1",
+                "text_anchor_residual_gain_macro_f1",
+                "text_anchor_shuffled_residual_macro_f1",
+                "common_shuffled_residual_macro_f1",
+                "residual_gain_vs_feature_shuffle_macro_f1",
+                "text_anchor_common_shuffled_residual_macro_f1",
+                "text_anchor_residual_gain_vs_feature_shuffle_macro_f1",
+            ],
+        )
+        residual_probe_by_mode_summary = flatten_summary(
             residual_probe_by_mode_all,
-            {
-                "seed",
-                "group",
-                "run_dir",
-                "residual_scope",
-                "residual_mode",
-            },
-        ),
-    )
+            ["group", "residual_scope", "residual_mode"],
+            numeric_value_columns(
+                residual_probe_by_mode_all,
+                {
+                    "seed",
+                    "group",
+                    "run_dir",
+                    "residual_scope",
+                    "residual_mode",
+                },
+            ),
+        )
     calibration_summary = flatten_summary(
         calibration_all,
         ["group", "label_mode", "relation_split"],
@@ -1191,21 +1372,33 @@ def main() -> int:
         index=False,
         encoding="utf-8-sig",
     )
+    if args.run_rc_balanced_add:
+        rc_balanced_add_delta_summary.to_csv(
+            summary_dir / "rc_balanced_add_delta_summary.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        rc_balanced_add_relation_state_summary.to_csv(
+            summary_dir / "rc_balanced_add_relation_state_delta_summary.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
     concat_aware_summary.to_csv(
         summary_dir / "concat_aware_motivation_summary.csv",
         index=False,
         encoding="utf-8-sig",
     )
-    residual_probe_summary.to_csv(
-        summary_dir / "residual_discriminative_probe_summary.csv",
-        index=False,
-        encoding="utf-8-sig",
-    )
-    residual_probe_by_mode_summary.to_csv(
-        summary_dir / "residual_probe_by_mode_summary.csv",
-        index=False,
-        encoding="utf-8-sig",
-    )
+    if args.run_residual_probe:
+        residual_probe_summary.to_csv(
+            summary_dir / "residual_discriminative_probe_summary.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+        residual_probe_by_mode_summary.to_csv(
+            summary_dir / "residual_probe_by_mode_summary.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
     calibration_summary.to_csv(
         summary_dir / "relation_state_distribution_calibration_summary.csv",
         index=False,
@@ -1298,6 +1491,21 @@ def main() -> int:
             ["lambda_align", "group"],
         ),
     ]
+    if args.run_rc_balanced_add:
+        error_frames.extend(
+            [
+                (
+                    "rc_balanced_add_delta",
+                    rc_balanced_add_delta_summary,
+                    ["rc_balanced_mode", "group"],
+                ),
+                (
+                    "rc_balanced_add_relation_state",
+                    rc_balanced_add_relation_state_summary,
+                    ["rc_balanced_mode", "group"],
+                ),
+            ]
+        )
     if args.run_infonce:
         error_frames.extend(
             [
@@ -1386,6 +1594,37 @@ def main() -> int:
         direct_add_label: direct_add_relation_state_summary,
         "BalancedDirectAdd": balanced_direct_add_relation_state_summary,
     }
+    if args.run_rc_balanced_add:
+        for mode in args.rc_balanced_modes:
+            method = RC_BALANCED_METHOD_NAMES[mode]
+            mode_delta_all = rc_balanced_add_delta_all[
+                rc_balanced_add_delta_all["rc_balanced_mode"] == mode
+            ]
+            delta_summary_for_mode = rc_balanced_add_delta_summary[
+                rc_balanced_add_delta_summary["rc_balanced_mode"] == mode
+            ]
+            relation_all = rc_balanced_add_relation_state_delta_all[
+                rc_balanced_add_relation_state_delta_all["rc_balanced_mode"] == mode
+            ]
+            relation_summary_for_mode = rc_balanced_add_relation_state_summary[
+                rc_balanced_add_relation_state_summary["rc_balanced_mode"] == mode
+            ]
+            save_detailed_delta_plot(
+                mode_delta_all,
+                delta_summary_for_mode,
+                summary_dir / f"rc_balanced_add_{mode}_delta_detailed.png",
+                title=f"{method} gain by disagreement group",
+                ylabel=f"Delta Macro-F1 ({method} - Concat)",
+            )
+            save_detailed_delta_plot(
+                relation_all,
+                relation_summary_for_mode,
+                summary_dir / f"rc_balanced_add_{mode}_relation_state_delta_detailed.png",
+                group_order=RELATION_STATE_GROUP_ORDER,
+                title=f"{method} by relation state",
+                ylabel=f"Delta Macro-F1 ({method} - Concat)",
+            )
+            heatmap_summaries[method] = relation_summary_for_mode
     if args.run_dynamic_fusion:
         save_detailed_delta_plot(
             dynamic_fusion_delta_all,
@@ -1450,7 +1689,15 @@ def main() -> int:
         heatmap_summaries,
         summary_dir / "relation_state_method_comparison_heatmap.png",
     )
-    write_conclusion(delta_summary, summary_dir / "experiment_one_conclusion.json")
+    write_uncond_align_delta_conclusion(
+        delta_summary,
+        summary_dir / "uncond_align_delta_conclusion.json",
+    )
+    write_experiment_one_conclusion(
+        group_all,
+        group_summary,
+        summary_dir / "experiment_one_disagreement_difficulty.json",
+    )
 
     print("\nMulti-seed delta summary:")
     print(delta_summary.to_string(index=False))
@@ -1458,6 +1705,11 @@ def main() -> int:
     print(reliability_summary.to_string(index=False))
     print("\nRelation-state summary:")
     print(relation_state_summary.to_string(index=False))
+    if args.run_rc_balanced_add:
+        print("\nRC-BalancedAdd delta summary:")
+        print(rc_balanced_add_delta_summary.to_string(index=False))
+        print("\nRC-BalancedAdd relation-state summary:")
+        print(rc_balanced_add_relation_state_summary.to_string(index=False))
     if args.run_dynamic_fusion:
         print("\nDynamicFusion relation-state summary:")
         print(dynamic_fusion_relation_state_summary.to_string(index=False))
@@ -1474,10 +1726,11 @@ def main() -> int:
     print(balanced_direct_add_relation_state_summary.to_string(index=False))
     print("\nConcat-aware motivation summary:")
     print(concat_aware_summary.to_string(index=False))
-    print("\nResidual probe summary:")
-    print(residual_probe_summary.to_string(index=False))
-    print("\nResidual probe by mode summary:")
-    print(residual_probe_by_mode_summary.to_string(index=False))
+    if args.run_residual_probe:
+        print("\nResidual probe summary:")
+        print(residual_probe_summary.to_string(index=False))
+        print("\nResidual probe by mode summary:")
+        print(residual_probe_by_mode_summary.to_string(index=False))
     print("\nLambda strength delta summary:")
     print(lambda_delta_summary.to_string(index=False))
     if args.run_infonce:

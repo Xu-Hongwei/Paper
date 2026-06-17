@@ -1,20 +1,25 @@
 # Disagreement Phenomenon Experiment
 
-This package is the clean motivation loop for CoPA-v5:
+This package is the clean motivation loop for CoPA-v6:
 
-> paired multimodal samples are not always alignment-positive.
+> multimodal disagreement is structured, so fusion should condition how it
+> utilizes disagreement on relation states.
 
 The motivation experiment is intentionally narrow. It does not try to prove the
-full CoPA-v5 method. It tests whether cross-modal alignment gains depend on
-the relation state of a sample, and whether reliable disagreement contains a
-diagnostic residual signal.
+full CoPA-v6 method. It tests whether high disagreement is actually difficult,
+whether reliability disambiguates High-D samples, whether unconditional
+alignment / ordinary InfoNCE / dynamic weighting are insufficient, and whether
+balanced utilization is a stronger clue for reliable disagreement.
 
-For a fuller Chinese walkthrough of the motivation, terminology, examples,
-CSV outputs, and code-level caveats, see:
+For the fuller historical Chinese walkthrough of the v5 motivation,
+terminology, examples, CSV outputs, and code-level caveats, see:
 
 ```text
 MOTIVATION_EXPERIMENT_GUIDE.md
 ```
+
+The v6 framing in this README and `论文灵感/version6/` supersedes older guide
+sections that describe `BalancedDirectAdd` as appendix-only.
 
 Older method notes, full CoPA-v5 details, label-aware diagnostics, prototype
 checks, and appendix-style code snapshots were moved to:
@@ -32,20 +37,21 @@ label-level decision boundaries through the supervised objective:
 concat(h_text, h_vision, h_audio) -> y
 ```
 
-The narrower claim is that Concat and unconditional alignment objectives do not
-explicitly model same-sample relation states. A paired sample can be reliable
-agreement, uncertain agreement, reliable disagreement, or noisy disagreement.
-Those cases should not all be treated as unconditional alignment positives.
+The narrower v6 claim is that high cross-modal disagreement is not automatically
+bad. A paired sample can be reliable agreement, uncertain agreement, reliable
+disagreement, or noisy disagreement. Those cases should not all be treated as
+unconditional alignment positives, nor should they all receive the same fusion
+interaction.
 
-For v5, text is the semantic anchor. The primary disagreement score therefore
-uses text-anchor pairs only:
+For the current v6 motivation, text remains the default semantic anchor. The
+primary disagreement score therefore uses text-anchor pairs only:
 
 ```text
 D_text_anchor = mean(JSD(text, audio), JSD(text, vision))
 ```
 
 Audio-vision disagreement is still available as a backup/full-pair diagnostic,
-but it is not the default v5 motivation grouping.
+but it is not the default v6 motivation grouping.
 
 ## Expected Data
 
@@ -82,9 +88,19 @@ label > 0  -> positive
 
 ## Primary Motivation Flow
 
-The clean motivation loop has four parts.
+The clean v6 motivation loop has four required motivation checks, two
+supplementary diagnostics, and one optional pilot. The required checks are
+enough for a motivation-first paper claim; the pilot should not be written as
+final method success.
 
-1. Relation-state diagnostic
+1. Disagreement is not difficulty
+
+   Train the supervised Concat baseline and report Low-D / Mid-D / High-D
+   performance. On the current MOSEI multi-seed evidence, Concat is strongest
+   on High-D, so the motivation should not claim that disagreement is
+   inherently harmful or noisy.
+
+2. Relation-state diagnostic
 
    Train the reference diagnostic model, use validation thresholds only, and
    apply the fixed thresholds to test samples:
@@ -127,13 +143,14 @@ The clean motivation loop has four parts.
    ND = High-D + Low-R   noisy disagreement
    ```
 
-2. Unconditional alignment sensitivity
+3. Old solutions are insufficient
 
    The main motivation table compares the supervised Concat baseline with:
 
    ```text
    UncondAlign
    Uncond InfoNCE
+   DynamicFusion
    ```
 
    InfoNCE uses projection heads by default:
@@ -147,7 +164,7 @@ The clean motivation loop has four parts.
    loss from being interpreted as directly acting on the classifier hidden
    states. The default is `--use_nce_projection --nce_proj_dim 128`.
 
-   All alignment/contrastive components use the same pair graph in a run. The primary v5
+   All alignment/contrastive components use the same pair graph in a run. The primary v6
    setting is `--pair_mode text_anchor`, so diagnostics, UncondAlign and
    InfoNCE all use `T-A/T-V`. The appendix counterpart is
    `--pair_mode full_pair`, where all of them include `A-V` as well. The
@@ -157,14 +174,37 @@ The clean motivation loop has four parts.
    unconditional alignment gains are relation-dependent
    ```
 
-   DirectAdd remains implemented for compatibility and appendix diagnostics.
+   DirectAdd remains implemented for compatibility and text-injection
+   diagnostics.
    Under `text_anchor` it is reported as `TextInject`, because it keeps text
    fixed and injects text information into audio and vision rather than acting
-   as a plain alignment objective. A separate appendix baseline,
-   `BalancedDirectAdd`, LayerNorms the three hidden states, averages them, and
-   adds the same averaged vector to all modalities.
+   as a plain alignment objective.
 
-3. Selective agreement evidence
+4. Balanced utilization clue
+
+   `BalancedDirectAdd` LayerNorms the three hidden states, averages them, and
+   adds the same averaged vector to all modalities. In v6 it is no longer only
+   appendix material: it is the current minimal positive clue that reliable
+   disagreement benefits more from balanced cross-modal utilization than from
+   unconditional alignment, ordinary InfoNCE, or dynamic modality weighting.
+
+5. Optional pilot: relation-conditioned BalancedAdd
+
+   `RC-BalancedAdd` reuses the BalancedDirectAdd injection but replaces one
+   global alpha with sample-level `alpha_i` from relation states:
+
+   ```text
+   rd_only: RD=1.0, all other states=0.0
+   hard:    RD=1.0, RA=0.3, Mid-D=0.3, ND=0.1, UA=0.1
+   ```
+
+   Relation states come from reference-model prediction distributions and
+   validation thresholds. Test labels are not used to assign alpha. In the
+   current framing this is exploratory: it tests whether relation-conditioned
+   scheduling is worth developing, but the core paper motivation does not depend
+   on it beating fixed `BalancedDirectAdd`.
+
+6. Selective agreement evidence
 
    Compare `RA` and `UA` to test whether Low-D samples should all be treated as
    alignment-positive. The expected claim is:
@@ -173,7 +213,7 @@ The clean motivation loop has four parts.
    reliable agreement is a better alignment-positive signal than Low-D alone
    ```
 
-4. Supplementary residual probe
+7. Supplementary residual probe
 
    Use label-free diagnostic features from the reference model, not
    method-trained residual heads or true-label class means. Hidden states are
@@ -184,7 +224,7 @@ The clean motivation loop has four parts.
    |h_text - h_vision|
    ```
 
-   Residual probe is supplementary, not the main claim. It can be run with
+   Residual probe is boundary analysis, not the main claim. It can be run with
    residual modes `abs`, `signed`, `prod`, and `all`; each mode reports matched
    residual, label-shuffled residual, and sample-shuffled residual controls.
    The cautious evidence is:
@@ -195,24 +235,40 @@ The clean motivation loop has four parts.
    and common+residual > common+sample-shuffled residual
    ```
 
-   This supports only the cautious claim that reliable disagreement may contain
-   discriminative residual information.
+   Current v6 framing treats negative or weak residual results as evidence that
+   simple residual utilization is not the main answer.
 
 ## Main CLI
 
 Single seed:
 
 ```powershell
-python -B code\disagreement_phenomenon\scripts\run_phenomenon.py --dataset mosi --data_root E:\Xu\data\MultiBench --seed 1 --epochs 25 --patience 6 --run_infonce --pair_mode text_anchor --relation_split balanced_within_d --deterministic
+python -B code\disagreement_phenomenon\scripts\run_phenomenon.py --preset v6_motivation --dataset mosi --data_root E:\Xu\data\MultiBench --seed 1
 ```
 
 MOSEI multi-seed:
 
 ```powershell
-python -B code\disagreement_phenomenon\scripts\run_multi_seed.py --dataset mosei --data_root E:\Xu\data\MultiBench --seeds 1 2 3 4 5 --batch_size 1024 --num_workers 0 --epochs 25 --patience 6 --quiet --run_infonce --pair_mode text_anchor --relation_split balanced_within_d --deterministic
+python -B code\disagreement_phenomenon\scripts\run_multi_seed.py --preset v6_motivation --dataset mosei --data_root E:\Xu\data\MultiBench --seeds 1 2 3 4 5
 ```
 
-The primary v5 pair graph is:
+Optional pilot:
+
+```powershell
+python -B code\disagreement_phenomenon\scripts\run_multi_seed.py --preset v6_pilot --dataset mosei --data_root E:\Xu\data\MultiBench --seeds 1 2 3 4 5
+```
+
+Appendix bundle:
+
+```powershell
+python -B code\disagreement_phenomenon\scripts\run_multi_seed.py --preset appendix_full --dataset mosei --data_root E:\Xu\data\MultiBench --seeds 1 2 3 4 5
+```
+
+Presets only set defaults. Any explicit flag still overrides them, for example
+`--preset v6_motivation --no-run_dynamic_fusion` or
+`--preset v6_motivation --pair_mode full_pair`.
+
+The primary v6 pair graph is:
 
 ```powershell
 --pair_mode text_anchor
@@ -245,10 +301,10 @@ training loss.
 The older specific flags `--nce_pair_mode`, `--disagreement_pair_mode`,
 `--kernel_pair_mode`, and `--align_pair_mode` are kept for compatibility, but
 they must match the unified `--pair_mode` when provided. `--direct_add_pair_mode`
-only selects the primary DirectAdd/TextInject appendix mode (`text_anchor` or
-`full_pair`). `BalancedDirectAdd` is always trained and reported as a separate
-appendix baseline with `direct_add_pair_mode=balanced`, so it cannot be
-accidentally used as the primary DirectAdd run.
+only selects the primary DirectAdd/TextInject diagnostic mode (`text_anchor` or
+`full_pair`). `BalancedDirectAdd` is always trained and reported separately with
+`direct_add_pair_mode=balanced`; v6 `RC-BalancedAdd` is enabled explicitly with
+`--run_rc_balanced_add --rc_balanced_modes rd_only hard`.
 
 ## Primary Outputs
 
@@ -263,16 +319,34 @@ high_d_reliability_delta.csv
 relation_state_metrics.csv
 relation_state_delta.csv
 relation_state_distribution_calibration.csv
-kernel_distribution_relation_metrics.csv
-kernel_distribution_relation_summary.csv
 uncond_align_relation_delta.csv
 direct_add_delta_metrics.csv
 direct_add_relation_state_delta.csv
 balanced_direct_add_delta_metrics.csv
 balanced_direct_add_relation_state_delta.csv
+concat_aware_motivation.csv
+```
+
+When `--run_residual_probe` is used:
+
+```text
 residual_discriminative_probe.csv
 residual_probe_by_mode.csv
-concat_aware_motivation.csv
+```
+
+When `--run_kernel_dist_diagnostic` is used:
+
+```text
+kernel_distribution_relation_metrics.csv
+kernel_distribution_relation_summary.csv
+```
+
+When `--run_rc_balanced_add` is used:
+
+```text
+rc_balanced_add_valid.csv
+rc_balanced_add_delta_metrics.csv
+rc_balanced_add_relation_state_delta.csv
 ```
 
 When `--run_infonce` is used:
@@ -286,6 +360,14 @@ infonce_relation_state_delta.csv
 infonce_relation_delta.csv
 ```
 
+When `--run_dynamic_fusion` is used:
+
+```text
+dynamic_fusion_delta_metrics.csv
+dynamic_fusion_relation_state_delta.csv
+dynamic_fusion_weight_relation_summary.csv
+```
+
 Multi-seed primary files:
 
 ```text
@@ -293,15 +375,34 @@ multi_seed_delta_summary.csv
 error_control_report.csv
 relation_state_delta_summary.csv
 relation_state_distribution_calibration_summary.csv
-kernel_distribution_relation_summary.csv
 uncond_align_relation_delta_summary.csv
 direct_add_delta_summary.csv
 direct_add_relation_state_delta_summary.csv
 balanced_direct_add_delta_summary.csv
 balanced_direct_add_relation_state_delta_summary.csv
+concat_aware_motivation_summary.csv
+experiment_one_disagreement_difficulty.json
+uncond_align_delta_conclusion.json
+```
+
+When `--run_residual_probe` is used:
+
+```text
 residual_discriminative_probe_summary.csv
 residual_probe_by_mode_summary.csv
-concat_aware_motivation_summary.csv
+```
+
+When `--run_kernel_dist_diagnostic` is used:
+
+```text
+kernel_distribution_relation_summary.csv
+```
+
+When `--run_rc_balanced_add` is used:
+
+```text
+rc_balanced_add_delta_summary.csv
+rc_balanced_add_relation_state_delta_summary.csv
 ```
 
 When `--run_infonce` is used:
@@ -314,7 +415,37 @@ infonce_relation_delta_summary.csv
 infonce_lambda_test_delta_summary.csv
 ```
 
+When `--run_dynamic_fusion` is used:
+
+```text
+dynamic_fusion_delta_summary.csv
+dynamic_fusion_relation_state_delta_summary.csv
+dynamic_fusion_weight_relation_summary.csv
+```
+
 ## Backup / Appendix Material
+
+You do not need to run every appendix diagnostic for the motivation-first
+version. Use this triage:
+
+```text
+Required main evidence:
+- MOSEI three-class text_anchor multi-seed with --preset v6_motivation
+- relation_state_distribution_calibration_summary.csv
+- multi_seed_group_metrics_summary.csv
+- relation-state delta summaries for UncondAlign, InfoNCE, DynamicFusion
+- balanced_direct_add_relation_state_delta_summary.csv
+
+Optional pilot:
+- --run_rc_balanced_add --rc_balanced_modes rd_only hard
+
+Appendix only when a reviewer/narrative needs it:
+- MOSI robustness
+- binary label robustness
+- full_pair diagnostics
+- kernel MMD distribution diagnostics
+- residual probe boundary analysis with `--run_residual_probe`
+```
 
 The active motivation runner no longer writes label-aware, prototype, or CoPA
 method outputs. Those branches are preserved in the backup snapshot:

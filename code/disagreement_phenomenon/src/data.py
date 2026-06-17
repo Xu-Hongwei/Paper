@@ -139,6 +139,7 @@ class MultimodalSplitDataset(Dataset):
         self.audio = torch.as_tensor(split.audio, dtype=torch.float32)
         self.label_reg = torch.as_tensor(split.label_reg, dtype=torch.float32).view(-1)
         self.label_cls = torch.as_tensor(split.label_cls, dtype=torch.long).view(-1)
+        self.rc_balanced_alpha: torch.Tensor | None = None
 
     def __len__(self) -> int:
         """返回数据集样本数。"""
@@ -160,7 +161,21 @@ class MultimodalSplitDataset(Dataset):
             "label_reg": self.label_reg[index],
             "label_cls": self.label_cls[index],
             "index": torch.tensor(index, dtype=torch.long),
+            **(
+                {"rc_balanced_alpha": self.rc_balanced_alpha[index]}
+                if self.rc_balanced_alpha is not None
+                else {}
+            ),
         }
+
+    def set_rc_balanced_alpha(self, alpha: np.ndarray) -> None:
+        """设置 v6 Relation-Conditioned BalancedAdd 的样本级注入强度。"""
+        alpha = np.asarray(alpha, dtype=np.float32).reshape(-1)
+        if alpha.shape[0] != len(self):
+            raise ValueError(
+                f"rc_balanced_alpha has {alpha.shape[0]} samples but dataset has {len(self)}."
+            )
+        self.rc_balanced_alpha = torch.as_tensor(alpha, dtype=torch.float32)
 
 
 def _load_split(data: np.lib.npyio.NpzFile, split: str, label_mode: str) -> SplitArrays:

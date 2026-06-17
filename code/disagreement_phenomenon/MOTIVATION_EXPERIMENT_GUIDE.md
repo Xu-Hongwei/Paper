@@ -1,6 +1,6 @@
 # CoPA 动机实验详细说明
 
-这份文档解释 `code/disagreement_phenomenon` 当前动机实验的完整流程、术语、表格读法和常见误解。它的目标不是介绍完整 CoPA-v5 方法，而是把目前这套“动机证据闭环”讲清楚：
+这份文档主要解释 `code/disagreement_phenomenon` 的 v5 动机实验流程、术语、表格读法和常见误解。v6 当前主线已经转向“分歧有结构，关键是按关系状态调度分歧”；最新入口以 README 和 `论文灵感/version6/` 为准。本文件仍用于查术语和旧实验边界，但关于 BalancedDirectAdd 的 appendix-only 说法已被 v6 覆盖。
 
 ```text
 同一个多模态样本不一定天然适合无条件对齐。
@@ -21,7 +21,7 @@
 
 这叫 same-sample positive assumption。动机实验要检验的是：这个假设是否总是合理。
 
-更具体地说，当前实验不直接证明“CoPA-v5 主方法一定最好”，而是先证明一个更小、更稳的动机：
+更具体地说，v5 实验不直接证明“CoPA-v5 主方法一定最好”，而是先证明一个更小、更稳的动机：
 
 ```text
 普通无条件对齐的收益不是全局稳定的；
@@ -722,7 +722,7 @@ fuse_vision = h_v + alpha * h_t
 
 ### 10.5 BalancedDirectAdd
 
-BalancedDirectAdd 是更公平的 appendix baseline：
+BalancedDirectAdd 在 v5 中是更公平的 appendix baseline；在 v6 中，它被提升为“平衡利用可靠高分歧”的最小正向线索：
 
 ```text
 n_t = LayerNorm(h_t)
@@ -737,21 +737,23 @@ fuse_vision = h_v + alpha * h_avg
 
 它对三个模态一视同仁，不把 text 单独注入到别的模态。
 
-代码会始终把它作为单独 baseline 训练和输出，而不是通过
+代码会始终把它作为单独方法训练和输出，而不是通过
 `--direct_add_pair_mode balanced` 选择。这样 TextInject/DirectAdd 和
 BalancedDirectAdd 的含义不会混在一起。
 
-注意：
+v6 注意：
 
 ```text
-BalancedDirectAdd 可以很强，但它不是主动机证据。
+BalancedDirectAdd 如果在 RD 上稳定优于 Concat，就可以作为 relation-conditioned balanced utilization 的动机桥梁。
 ```
 
-如果它很强，说明“公平融合增强”有价值；但论文主线仍然应该看：
+它本身仍不是最终 v6 方法，因为它对所有样本使用同一个 alpha；因此当前主文只把它写成动机桥梁。主线对照先看：
 
 ```text
-Concat / UncondAlign / UncondInfoNCE
+Concat / UncondAlign / UncondInfoNCE / DynamicFusion / BalancedDirectAdd
 ```
+
+`RC-BalancedAdd` 目前只作为 exploratory pilot：可以说明 relation-conditioned scheduling 值得继续做，但不要把它写成最终方法已经成功。
 
 ## 11. 为什么要做 lambda sweep
 
@@ -1008,8 +1010,6 @@ uncond_align_relation_delta_summary.csv
 infonce_delta_summary.csv
 infonce_relation_state_delta_summary.csv
 error_control_report.csv
-residual_discriminative_probe_summary.csv
-residual_probe_by_mode_summary.csv
 concat_aware_motivation_summary.csv
 ```
 
@@ -1018,6 +1018,13 @@ concat_aware_motivation_summary.csv
 ```text
 *_all.csv      = 每个 seed 的原始合并
 *_summary.csv  = mean/std/CI/error-control 汇总
+```
+
+如果显式打开 appendix residual probe（`--run_residual_probe`），还会额外生成：
+
+```text
+residual_discriminative_probe_summary.csv
+residual_probe_by_mode_summary.csv
 ```
 
 ## 16. 推荐读表顺序
@@ -1098,7 +1105,7 @@ TextInject 和 BalancedDirectAdd 是否作为补充对照有意义？
 
 不要让它们替代主线。
 
-### 第五步：看 residual probe
+### 第五步：看 residual probe（appendix，可选）
 
 ```text
 residual_probe_by_mode_summary.csv
@@ -1216,7 +1223,7 @@ vision -> text
 后续又修复了两个实验边界问题：
 
 ```text
-1. direct_add_pair_mode 不再接受 balanced，BalancedDirectAdd 始终是独立 appendix baseline。
+1. direct_add_pair_mode 不再接受 balanced，BalancedDirectAdd 始终是独立输出；在 v6 中它是平衡利用线索，不再只是 appendix baseline。
 2. lambda/alpha sweep 的每个候选训练前重置随机种子，减少候选之间的初始化和 shuffle 噪声。
 ```
 
@@ -1225,25 +1232,33 @@ vision -> text
 ### 19.1 单 seed 快速检查
 
 ```powershell
-python -B code\disagreement_phenomenon\scripts\run_phenomenon.py --dataset mosi --data_root E:\Xu\data\MultiBench --seed 1 --batch_size 1024 --num_workers 0 --epochs 25 --patience 6 --quiet --run_infonce --pair_mode text_anchor --relation_split balanced_within_d --deterministic
+python -B code\disagreement_phenomenon\scripts\run_phenomenon.py --preset v6_motivation --dataset mosi --data_root E:\Xu\data\MultiBench --seed 1
 ```
 
 ### 19.2 MOSI 5 seeds 主线
 
 ```powershell
-python -B code\disagreement_phenomenon\scripts\run_multi_seed.py --dataset mosi --data_root E:\Xu\data\MultiBench --seeds 1 2 3 4 5 --batch_size 1024 --num_workers 0 --epochs 25 --patience 6 --quiet --run_infonce --pair_mode text_anchor --relation_split balanced_within_d --deterministic
+python -B code\disagreement_phenomenon\scripts\run_multi_seed.py --preset v6_motivation --dataset mosi --data_root E:\Xu\data\MultiBench --seeds 1 2 3 4 5
 ```
 
 ### 19.3 Binary robustness
 
 ```powershell
-python -B code\disagreement_phenomenon\scripts\run_multi_seed.py --dataset mosi --data_root E:\Xu\data\MultiBench --seeds 1 2 3 4 5 --batch_size 1024 --num_workers 0 --epochs 25 --patience 6 --quiet --run_infonce --pair_mode text_anchor --relation_split balanced_within_d --label_mode binary --deterministic
+python -B code\disagreement_phenomenon\scripts\run_multi_seed.py --preset v6_motivation --dataset mosi --data_root E:\Xu\data\MultiBench --seeds 1 2 3 4 5 --label_mode binary
 ```
 
 ### 19.4 MOSEI 5 seeds
 
 ```powershell
-python -B code\disagreement_phenomenon\scripts\run_multi_seed.py --dataset mosei --data_root E:\Xu\data\MultiBench --seeds 1 2 3 4 5 --batch_size 1024 --num_workers 0 --epochs 25 --patience 6 --quiet --run_infonce --pair_mode text_anchor --relation_split balanced_within_d --deterministic
+python -B code\disagreement_phenomenon\scripts\run_multi_seed.py --preset v6_motivation --dataset mosei --data_root E:\Xu\data\MultiBench --seeds 1 2 3 4 5
+```
+
+### 19.5 可选 pilot：RC-BalancedAdd
+
+只有在需要补充“relation-conditioned 调度是否值得继续发展”时跑：
+
+```powershell
+python -B code\disagreement_phenomenon\scripts\run_multi_seed.py --preset v6_pilot --dataset mosei --data_root E:\Xu\data\MultiBench --seeds 1 2 3 4 5
 ```
 
 ## 20. 当前最稳的论文叙事
@@ -1257,4 +1272,27 @@ python -B code\disagreement_phenomenon\scripts\run_multi_seed.py --dataset mosei
 4. 因此，relation-aware selective alignment 比无条件拉近所有同样本模态更合理。
 ```
 
-不要把 residual probe 写成主命题；不要让 BalancedDirectAdd 抢主线；不要把 confidence-based R 写成真实可靠性标签。
+不要把 residual probe 写成主命题；不要把固定 BalancedDirectAdd 写成最终方法；不要把 confidence-based R 写成真实可靠性标签。
+
+## 21. Appendix 是否都要跑？
+
+不需要。当前目标是证明论文动机，appendix 应该按需补强，而不是全部堆上去。
+
+```text
+主文必跑：
+1. MOSEI three-class text_anchor multi-seed。
+2. --run_infonce 和 --run_dynamic_fusion，用来证明旧解法不充分。
+3. 默认 BalancedDirectAdd 输出，用来证明 balanced utilization 有最小正向线索。
+
+可选 pilot：
+4. --run_rc_balanced_add --rc_balanced_modes rd_only hard。
+
+只有需要 robustness 或 reviewer 追问时再跑：
+5. MOSI 复现。
+6. binary label robustness。
+7. full_pair 诊断。
+8. kernel MMD distribution 诊断。
+9. residual probe boundary analysis：显式加 `--run_residual_probe`。
+```
+
+写作优先级也按这个顺序：先把 MOSEI 主线写清楚，再用 MOSI/appendix 做边界和稳健性，不要让 appendix 抢主线。
